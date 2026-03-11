@@ -1,0 +1,128 @@
+# Cron
+
+## Overview
+
+Nerve uses APScheduler for in-process async job scheduling. Jobs can run in isolated sessions (fresh each time) or persistent sessions (context preserved across runs) and deliver output to configured channels.
+
+## Job Definition
+
+Jobs are defined in a YAML file (default: `~/.nerve/cron/jobs.yaml`):
+
+```yaml
+jobs:
+  - id: morning-briefing
+    schedule: "30 11 * * *"        # 11:30 AM daily
+    prompt: "Give me a morning briefing..."
+    description: "Daily morning summary"
+    model: claude-sonnet-4-6       # Optional model override
+    target: telegram               # Delivery channel
+    session_mode: isolated         # "isolated", "persistent", or "main"
+    enabled: true
+
+  - id: system-monitor
+    schedule: "30m"                  # Every 30 minutes
+    prompt: "Check system health and report changes since your last check."
+    session_mode: persistent         # Keeps context across runs
+    context_rotate_hours: 48         # Fresh context every 48h
+    enabled: true
+
+  - id: task-reminder
+    schedule: "0 */2 * * *"        # Every 2 hours
+    prompt: "Check for overdue tasks..."
+    target: telegram
+    enabled: true
+```
+
+## Job Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `id` | string | yes | Unique job identifier |
+| `schedule` | string | yes | Crontab expression or interval (`2h`, `30m`) |
+| `prompt` | string | yes | Message sent to the agent |
+| `description` | string | no | Human-readable description |
+| `model` | string | no | Override model (default: `agent.cron_model`) |
+| `target` | string | no | Delivery channel (default: `telegram`) |
+| `session_mode` | string | no | `isolated` (new session per run), `persistent` (reuse context), or `main` |
+| `context_rotate_hours` | int | no | Hours before persistent context resets (default: 24, 0 = never) |
+| `reminder_mode` | bool | no | Persistent only: send short reminder instead of full prompt on subsequent runs (default: false) |
+| `enabled` | bool | no | Whether the job is active (default: true) |
+
+## Session Modes
+
+### Isolated (default)
+
+Each run creates a fresh session (`cron:{job_id}:{timestamp}`). The agent has no in-context memory of previous runs. This is best for self-contained jobs like daily briefings or cleanup tasks.
+
+### Persistent
+
+Jobs with `session_mode: persistent` maintain SDK conversation context across runs:
+
+- **First trigger**: Creates a fresh session (`cron:{job_id}`) and runs the prompt.
+- **Subsequent triggers**: Resumes the same SDK session and sends the prompt as a new message. The agent sees all prior runs in-context.
+- **Context rotation**: Every `context_rotate_hours` (default: 24), the context is reset. Old messages remain in the database and are searchable via memU, but the agent starts with a clean slate.
+
+This is useful for jobs that benefit from accumulated context:
+- Monitoring jobs that track changes over time
+- Summary jobs that should remember what was already reported
+- Multi-step workflows that build on previous results
+
+Between runs, the SDK client subprocess is freed (no resource leak). On the next trigger, the SDK resumes the session from its stored state.
+
+#### Reminder Mode
+
+Persistent jobs with `reminder_mode: true` avoid resending the full prompt on every trigger. Instead:
+
+- **First run** (or after context rotation): The full prompt is sent, with a note explaining that subsequent runs will use a short reminder.
+- **Subsequent runs**: A short message ("Scheduled run — continue with the same task as before.") is sent instead of the full prompt. The agent already has the original instructions in-context from the first run.
+
+This significantly reduces token usage for frequently-triggered persistent jobs (e.g., every 15 minutes).
+
+### Main
+
+Jobs with `session_mode: main` run in the main user session instead of an isolated one.
+
+## CLI Usage
+
+```bash
+# Run a specific job manually
+nerve cron morning-briefing
+
+# List available jobs
+nerve cron
+```
+
+## Built-in Jobs
+
+### `skill-extractor` (every 12 hours)
+Identifies repeated workflows and domain knowledge from recent conversations, memory patterns, and completed tasks. Proposes new skills via task+plan system for human review.
+
+### `skill-reviser` (weekly, Sunday 3 AM)
+Reviews all existing skills for accuracy (outdated paths, credentials), completeness (missing steps, known issues), and quality (trigger phrases, examples). Proposes revisions via task+plan system.
+
+Both skill jobs use `source="skill-extractor"` or `source="skill-reviser"` on created tasks. When their plans are approved, the plan approval handler creates/updates the skill directly from the plan content (which is a full SKILL.md file) instead of spawning an implementation session.
+
+## Source Runners
+
+In addition to YAML-defined cron jobs, the cron service auto-registers **source runners** from the `sync:` config. Each enabled source becomes an APScheduler job with ID `source:<name>` (e.g., `source:gmail`, `source:github`).
+
+Source runners:
+- Run on the schedule defined in their config (`sync.<source>.schedule`)
+- Use `SourceRunner` to fetch → process → advance cursor
+- Are logged in both `cron_logs` and `source_run_log` tables
+- Appear in `list_jobs()` alongside regular cron jobs
+
+See [sources.md](sources.md) for full documentation.
+
+## Logging
+
+Every cron and source run is logged in the `cron_logs` SQLite table:
+- `job_id` — Which job ran (e.g., `morning-briefing` or `source:gmail`)
+- `started_at` / `finished_at` — Timestamps
+- `status` — `success` or `error`
+- `output` — First 2000 chars of response / summary
+- `error` — Error message if failed
+
+Source runs also log to `source_run_log` with per-source diagnostics (records fetched/processed, errors).
+
+View logs via API: `GET /api/cron/logs?job_id=morning-briefing&limit=10`

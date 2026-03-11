@@ -1,0 +1,53 @@
+# Nerve — Personal AI Assistant Configuration
+# Copy to config.yaml and customize. Secrets go in config.local.yaml (gitignored).
+
+# Core
+workspace: ~/nerve-workspace    # Path to workspace with SOUL.md, MEMORY.md, etc.
+timezone: America/New_York
+
+# Agent
+agent:
+  model: claude-opus-4-6         # Primary model for conversations
+  cron_model: claude-sonnet-4-6  # Cheaper model for cron jobs
+  max_turns: 50                  # Max agentic turns per request
+  max_concurrent: 4              # Max concurrent agent sessions
+
+# Gateway
+gateway:
+  host: 0.0.0.0
+  port: 8900
+  ssl:
+    cert: ~/.nerve/certs/cert.pem
+    key: ~/.nerve/certs/key.pem
+
+# Channels
+telegram:
+  enabled: true
+  dm_policy: pairing             # "open" or "pairing" (require pairing code)
+  stream_mode: partial           # "partial" (edit messages) or "full" (wait for complete)
+
+# Quiet hours (local timezone)
+quiet_start: "02:00"
+quiet_end: "12:00"
+
+# Sync sources
+sync:
+  telegram:
+    enabled: true
+    monitored_folders: [Work, Friends]
+  gmail:
+    enabled: true
+    accounts: []                 # Set in config.local.yaml
+    schedule: "*/15 * * * *"
+  github:
+    enabled: true
+    schedule: "*/15 * * * *"
+
+# Memory (memU)
+memory:
+  chat_model: claude-sonnet-4-6
+  embed_model: text-embedding-3-small
+
+# Cron
+cron:
+  jobs_file: ~/.nerve/cron/jobs.yaml

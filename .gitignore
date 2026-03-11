@@ -1,0 +1,49 @@
+# Config (user-specific)
+config.yaml
+config.local.yaml
+
+# Environment
+.env*
+
+# Data
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Web UI build
+web/node_modules/
+web/dist/
+
+# Runtime
+*.db
+*.db-journal
+*.log
+nerve.pid
+
+# Certs
+*.pem
+*.key
+
+# Sync data
+sync_data/
+*.jsonl
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,783 @@
+"""First-run bootstrap wizard — interactive CLI that guides through initial setup.
+
+Each step explains what the component does before asking for configuration.
+All choices are collected in memory; nothing is written until the final apply step.
+Ctrl+C at any point leaves the system untouched.
+"""
+
+from __future__ import annotations
+
+import os
+import secrets
+import shutil
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import click
+import yaml
+
+from nerve.workspace import initialize_workspace
+
+
+# --- Cron definitions for the wizard ---
+
+# Core crons are always enabled and not presented for selection.
+CORE_CRONS = [
+    {
+        "id": "memory-maintenance",
+        "schedule": "0 5 * * *",
+        "description": "Daily memory cleanup — dedup, prune stale entries, improve wording",
+        "session_mode": "isolated",
+        "model": "",
+        "prompt": (
+            "You are running a daily memory maintenance job. Work completely silently — do not output any text, only think.\n\n"
+            "Do the following:\n\n"
+            "## Phase 1: Gather Yesterday's Data\n\n"
+            "1. Use memory_records_by_date(date=yesterday, updated=true, limit=200) to get ALL records created or updated yesterday.\n"
+            "2. Optionally: use conversation_history(date=yesterday) for additional event context.\n\n"
+            "## Phase 2: Evaluate Each Record\n\n"
+            "For each record from yesterday, evaluate and act:\n"
+            "- **Exact duplicates**: Same fact already stored elsewhere → delete the worse copy\n"
+            "- **Category-redundant**: Adds nothing beyond category summary → delete\n"
+            "- **Stale/completed**: No longer true → delete\n"
+            "- **Generic knowledge**: Textbook facts not personal to the user → delete\n"
+            "- **Meta-noise**: Observations about the memory system itself → delete\n"
+            "- **Improvable**: Poorly worded or could be more useful → update via memory_update\n\n"
+            "## Phase 3: Category Review\n\n"
+            "If yesterday's memories revealed new important context, check whether category summaries need updating.\n\n"
+            "Rules:\n"
+            "- Never delete entries about people, relationships, or preferences unless exact duplicates\n"
+            "- Never delete actionable/pending items\n"
+            "- Updating is better than deleting\n"
+            "- When in doubt, keep the memory\n"
+            "- Do NOT log or memorize anything about this maintenance run\n"
+        ),
+    },
+]
+
+# Productivity crons the user can enable/disable.
+PRODUCTIVITY_CRONS = [
+    {
+        "id": "inbox-processor",
+        "name": "Inbox Processor",
+        "schedule": "*/30 * * * *",
+        "description": "Polls your connected sources (email, GitHub, Telegram) every 30 minutes. Creates tasks for actionable items, memorizes important facts, and sends you notifications for urgent things.",
+        "requires": "At least one sync source connected",
+        "session_mode": "persistent",
+        "context_rotate_hours": 24,
+        "reminder_mode": True,
+        "prompt": (
+            "Process the sync inbox by calling poll_all_sources(consumer=\"inbox\").\n\n"
+            "If there are new messages, review them and take appropriate action:\n"
+            "- **Create tasks** (via task_create) for items requiring follow-up\n"
+            "- **Memorize** important facts (via memorize) worth remembering\n"
+            "- **Ignore** routine notifications, spam, or low-signal items\n\n"
+            "Cross-source deduplication: if multiple sources report the same event, treat as ONE.\n\n"
+            "**Notifications — use them!**\n"
+            "- Use `notify` for urgent/high-priority items\n"
+            "- Use `ask_user` when unsure\n"
+            "- Do NOT notify for routine items\n\n"
+            "Be selective. If no new messages, reply \"No new messages.\"\n"
+        ),
+    },
+    {
+        "id": "task-planner",
+        "name": "Task Planner",
+        "schedule": "0 */4 * * *",
+        "description": "Every 4 hours, reviews your open tasks and proposes implementation plans. Plans go through an approval flow — nothing is executed without your OK.",
+        "requires": None,
+        "session_mode": "persistent",
+        "context_rotate_hours": 168,
+        "reminder_mode": False,
+        "prompt": (
+            "You are a proactive planning agent. Your job is to find a task worth working on and produce an implementation plan.\n\n"
+            "1. Use task_list to browse open tasks\n"
+            "2. Use plan_list to see which tasks already have plans — skip those\n"
+            "3. Pick ONE task and explore the relevant codebase\n"
+            "4. Call plan_propose(task_id, content) with your plan\n\n"
+            "If all tasks have plans or none are actionable, say so and stop.\n\n"
+            "After proposing a plan, use `notify` to alert the user.\n"
+        ),
+    },
+    {
+        "id": "skill-extractor",
+        "name": "Skill Extractor",
+        "schedule": "0 */12 * * *",
+        "description": "Every 12 hours, analyzes your recent activity to detect repeated workflows. When it finds a pattern, it proposes a reusable skill for your review.",
+        "requires": None,
+        "session_mode": "persistent",
+        "context_rotate_hours": 168,
+        "reminder_mode": False,
+        "prompt": (
+            "You are a skill extraction agent. Identify repeated workflows from recent activity and propose new skills.\n\n"
+            "1. Recall recent behavior patterns and events\n"
+            "2. Check existing skills to avoid duplicates\n"
+            "3. Look for repeated tool sequences, domain knowledge clusters, and reusable patterns\n"
+            "4. For each candidate (max 2): create a task and propose a plan with the full SKILL.md\n\n"
+            "If no candidates found, say so and stop.\n"
+            "After proposing, use `notify` to alert the user.\n"
+        ),
+    },
+    {
+        "id": "skill-reviser",
+        "name": "Skill Reviser",
+        "schedule": "0 3 * * 0",
+        "description": "Weekly review of existing skills — checks if instructions are still accurate, complete, and well-written. Proposes fixes through the approval flow.",
+        "requires": None,
+        "session_mode": "persistent",
+        "context_rotate_hours": 168,
+        "reminder_mode": False,
+        "prompt": (
+            "You are a skill revision agent. Review existing skills and propose improvements.\n\n"
+            "1. Load all skills and their content\n"
+            "2. Check accuracy (outdated paths, commands, URLs)\n"
+            "3. Check completeness (missing steps, known gotchas)\n"
+            "4. Check quality (clear descriptions, good trigger phrases)\n"
+            "5. For skills needing changes (max 3): create task + propose plan with updated SKILL.md\n\n"
+            "If all skills look good, say so and stop.\n"
+            "After proposing, use `notify` to alert the user.\n"
+        ),
+    },
+]
+
+
+@dataclass
+class SetupChoices:
+    """Collected user choices — nothing is written until apply()."""
+
+    mode: str = "personal"
+    anthropic_api_key: str = ""
+    openai_api_key: str = ""
+    workspace_path: Path = field(default_factory=lambda: Path("~/nerve-workspace"))
+    timezone: str = "America/New_York"
+    user_name: str = ""
+    telegram_bot_token: str = ""
+    enabled_crons: list[str] = field(default_factory=list)
+    # worker-specific
+    task_description: str = ""
+
+
+class SetupWizard:
+    """Interactive first-run setup wizard."""
+
+    def __init__(self, config_dir: Path):
+        self.config_dir = config_dir
+        self.choices = SetupChoices()
+
+    def run(self) -> SetupChoices:
+        """Run the full interactive wizard. Returns choices (nothing written yet)."""
+        self._welcome()
+        self._step_mode()
+        self._step_api_keys()
+        self._step_workspace()
+        if self.choices.mode == "personal":
+            self._step_identity()
+            self._step_channels()
+            self._step_crons()
+        else:
+            self._step_task_spec()
+        self._step_review()
+        self._apply()
+        self._done()
+        return self.choices
+
+    # --- Welcome ---
+
+    def _welcome(self) -> None:
+        click.clear()
+        click.secho("=" * 56, fg="cyan")
+        click.secho("  _   _                                ", fg="cyan")
+        click.secho(" | \\ | | ___  _ __ __   __ ___       ", fg="cyan")
+        click.secho(" |  \\| |/ _ \\| '__|\\ \\ / // _ \\  ", fg="cyan")
+        click.secho(" | |\\  |  __/| |    \\ V /|  __/      ", fg="cyan")
+        click.secho(" |_| \\_|\\___||_|     \\_/  \\___|    ", fg="cyan")
+        click.secho("=" * 56, fg="cyan")
+        click.echo()
+        click.secho(
+            "Nerve is a personal AI agent that lives on your server.\n"
+            "It has memory, runs background jobs, connects to your\n"
+            "services, and gets better over time.",
+            dim=True,
+        )
+        click.echo()
+        click.secho(
+            "This wizard will walk you through the initial setup.\n"
+            "Nothing is written until the final step — you can\n"
+            "Ctrl+C at any point to abort.",
+            dim=True,
+        )
+        click.echo()
+        click.pause("Press Enter to begin...")
+
+    # --- Step: Mode ---
+
+    def _step_mode(self) -> None:
+        click.clear()
+        click.secho("Step 1: Mode", fg="cyan", bold=True)
+        click.echo()
+        click.secho(
+            "Nerve has two modes:\n",
+            dim=True,
+        )
+        click.secho("  personal", fg="green", bold=True, nl=False)
+        click.secho(
+            " — Full-featured assistant for one person. Syncs your\n"
+            "              email, remembers preferences, develops personality.\n"
+            "              Has memory, cron jobs, notifications, and a web UI.",
+            dim=True,
+        )
+        click.echo()
+        click.secho("  worker", fg="green", bold=True, nl=False)
+        click.secho(
+            "   — Task-focused agent for teams. Monitors something,\n"
+            "              proposes fixes, implements after approval. Plan-driven\n"
+            "              with audit trail.",
+            dim=True,
+        )
+        click.echo()
+        self.choices.mode = click.prompt(
+            "Choose mode",
+            type=click.Choice(["personal", "worker"], case_sensitive=False),
+            default="personal",
+        )
+        click.echo()
+        click.secho(f"  → Setting up in {self.choices.mode} mode.", fg="green")
+        click.echo()
+
+    # --- Step: API Keys ---
+
+    def _step_api_keys(self) -> None:
+        click.clear()
+        click.secho("Step 2: API Keys", fg="cyan", bold=True)
+        click.echo()
+        click.secho(
+            "Nerve uses Claude as its AI engine. You need an Anthropic API key.\n"
+            "Get one at: https://console.anthropic.com",
+            dim=True,
+        )
+        click.echo()
+
+        while True:
+            key = click.prompt("Anthropic API key", hide_input=True)
+            if key.startswith("sk-ant-"):
+                self.choices.anthropic_api_key = key
+                break
+            click.secho("  Invalid key — should start with 'sk-ant-'. Try again.", fg="yellow")
+
+        click.echo()
+        click.secho(
+            "Optionally, an OpenAI key enables better memory search\n"
+            "(text-embedding-3-small for vector embeddings). Nerve works\n"
+            "without it but recall quality improves significantly.",
+            dim=True,
+        )
+        click.echo()
+        openai_key = click.prompt("OpenAI API key (Enter to skip)", default="", hide_input=True)
+        if openai_key:
+            self.choices.openai_api_key = openai_key
+
+        click.echo()
+        click.secho("  ✓ API keys configured", fg="green")
+        click.echo()
+
+    # --- Step: Workspace ---
+
+    def _step_workspace(self) -> None:
+        click.clear()
+        click.secho("Step 3: Workspace", fg="cyan", bold=True)
+        click.echo()
+        click.secho(
+            "Your workspace is where Nerve keeps its identity files, tasks,\n"
+            "skills, and memory. Think of it as Nerve's home directory.\n\n"
+            "It contains markdown files that define who Nerve is and how it\n"
+            "behaves — you can edit them anytime.",
+            dim=True,
+        )
+        click.echo()
+
+        if self.choices.mode == "personal":
+            click.secho("  Files created:", dim=True)
+            click.secho("    SOUL.md       — Personality, values, identity", dim=True)
+            click.secho("    IDENTITY.md   — Name, vibe, communication style", dim=True)
+            click.secho("    USER.md       — About you (the human)", dim=True)
+            click.secho("    AGENTS.md     — Operational guidelines", dim=True)
+            click.secho("    TOOLS.md      — Environment-specific notes", dim=True)
+            click.secho("    MEMORY.md     — Working memory (L1 cache)", dim=True)
+        else:
+            click.secho("  Files created:", dim=True)
+            click.secho("    SOUL.md       — Worker identity and principles", dim=True)
+            click.secho("    AGENTS.md     — Plan-driven workflow guidelines", dim=True)
+            click.secho("    TOOLS.md      — Environment-specific notes", dim=True)
+
+        click.echo()
+        ws = click.prompt("Workspace path", default="~/nerve-workspace")
+        self.choices.workspace_path = Path(ws)
+        click.echo()
+        click.secho(
+            "  Nerve also stores databases, logs, and session data in\n"
+            "  ~/.nerve/ — this is separate from your workspace.",
+            dim=True,
+        )
+        click.echo()
+
+    # --- Step: Identity (personal only) ---
+
+    def _step_identity(self) -> None:
+        click.clear()
+        click.secho("Step 4: About You", fg="cyan", bold=True)
+        click.echo()
+        click.secho(
+            "In personal mode, Nerve develops a relationship with you\n"
+            "over time. Let's set up the basics so it knows who it's\n"
+            "talking to.",
+            dim=True,
+        )
+        click.echo()
+        self.choices.user_name = click.prompt("Your name", default="")
+        self.choices.timezone = click.prompt("Your timezone", default="America/New_York")
+        click.echo()
+        click.secho(
+            "  You can customize Nerve's name, personality, and style later\n"
+            "  by editing SOUL.md and IDENTITY.md in your workspace.",
+            dim=True,
+        )
+        click.echo()
+
+    # --- Step: Channels (personal only) ---
+
+    def _step_channels(self) -> None:
+        click.clear()
+        step_num = "5" if self.choices.mode == "personal" else "4"
+        click.secho(f"Step {step_num}: Channels", fg="cyan", bold=True)
+        click.echo()
+        click.secho(
+            "Nerve communicates through channels. The web UI is always\n"
+            "available at localhost:8900.\n\n"
+            "Optionally, connect a Telegram bot for mobile notifications\n"
+            "and chat. You'll need a bot token from @BotFather.",
+            dim=True,
+        )
+        click.echo()
+        if click.confirm("Set up Telegram bot?", default=False):
+            token = click.prompt("  Bot token (from @BotFather)")
+            self.choices.telegram_bot_token = token
+            click.echo()
+            click.secho("  ✓ Telegram bot configured", fg="green")
+        else:
+            click.secho("  → Skipping Telegram. You can set it up later in config.local.yaml.", dim=True)
+        click.echo()
+
+    # --- Step: System Crons (personal only) ---
+
+    def _step_crons(self) -> None:
+        click.clear()
+        step_num = "6" if self.choices.mode == "personal" else "5"
+        click.secho(f"Step {step_num}: Background Jobs", fg="cyan", bold=True)
+        click.echo()
+        click.secho(
+            "Nerve runs background jobs on a schedule — like a personal\n"
+            "staff working while you sleep. Some are always on (memory\n"
+            "maintenance, session cleanup). Others are optional:",
+            dim=True,
+        )
+        click.echo()
+
+        enabled = []
+        for cron in PRODUCTIVITY_CRONS:
+            click.secho("  ┌─" + "─" * 52 + "┐", dim=True)
+            click.secho(f"  │  {cron['name']:<52}│", bold=True)
+            click.secho("  │" + " " * 53 + "│", dim=True)
+
+            # Word-wrap description to fit in the box
+            desc_lines = _wrap_text(cron["description"], width=51)
+            for line in desc_lines:
+                click.secho(f"  │  {line:<51}│", dim=True)
+
+            if cron.get("requires"):
+                click.secho("  │" + " " * 53 + "│", dim=True)
+                req_text = f"Requires: {cron['requires']}"
+                click.secho(f"  │  {req_text:<51}│", fg="yellow")
+
+            click.secho("  │" + " " * 53 + "│", dim=True)
+            click.secho(f"  │  Schedule: {cron['schedule']:<39}│", dim=True)
+            click.secho("  └─" + "─" * 52 + "┘", dim=True)
+
+            is_default = cron["id"] in ("inbox-processor", "task-planner")
+            if click.confirm(f"  Enable {cron['name'].lower()}?", default=is_default):
+                enabled.append(cron["id"])
+            click.echo()
+
+        self.choices.enabled_crons = enabled
+
+        click.secho("  Summary:", bold=True)
+        for cron in PRODUCTIVITY_CRONS:
+            status = "✓ enabled" if cron["id"] in enabled else "  disabled"
+            color = "green" if cron["id"] in enabled else None
+            click.secho(f"    {status}  {cron['name']}", fg=color)
+        click.secho("    ✓ always   Memory Maintenance (core)", fg="cyan")
+        click.echo()
+
+    # --- Step: Task Spec (worker only) ---
+
+    def _step_task_spec(self) -> None:
+        click.clear()
+        click.secho("Step 4: Task Description", fg="cyan", bold=True)
+        click.echo()
+        click.secho(
+            "In worker mode, Nerve needs to know what to do. Describe\n"
+            "your task — what to monitor, what to fix, what to report.\n\n"
+            "Examples:\n"
+            '  "Monitor CI for repo X and fix flaky tests"\n'
+            '  "Review PRs in org/repo and suggest improvements"\n'
+            '  "Watch production logs and alert on anomalies"',
+            dim=True,
+        )
+        click.echo()
+        self.choices.task_description = click.prompt("Describe your task")
+        click.echo()
+        click.secho(
+            "  This will be saved to TASK.md in your workspace.\n"
+            "  Nerve reads it at the start of every session.\n\n"
+            "  Nerve proposes fixes as plans, notifies you, and waits\n"
+            "  for approval before implementing.",
+            dim=True,
+        )
+        click.echo()
+
+    # --- Step: Review ---
+
+    def _step_review(self) -> None:
+        click.clear()
+        click.secho("Review", fg="cyan", bold=True)
+        click.echo()
+
+        ws = str(self.choices.workspace_path)
+        api_status = "Anthropic ✓"
+        if self.choices.openai_api_key:
+            api_status += "  OpenAI ✓"
+        else:
+            api_status += "  OpenAI —"
+
+        tg_status = "configured" if self.choices.telegram_bot_token else "not configured"
+
+        click.secho("  ┌──────────────────────────────────────────────┐", dim=True)
+        click.secho("  │            Setup Summary                     │", bold=True)
+        click.secho("  ├──────────────────────────────────────────────┤", dim=True)
+        click.secho(f"  │  Mode:       {self.choices.mode:<33}│")
+        click.secho(f"  │  Workspace:  {ws:<33}│")
+        click.secho(f"  │  API keys:   {api_status:<33}│")
+
+        if self.choices.mode == "personal":
+            click.secho(f"  │  Telegram:   {tg_status:<33}│")
+            if self.choices.enabled_crons:
+                cron_str = ", ".join(self.choices.enabled_crons)
+                # Wrap if too long
+                if len(cron_str) > 33:
+                    lines = _wrap_text(cron_str, width=33)
+                    click.secho(f"  │  Crons:      {lines[0]:<33}│")
+                    for line in lines[1:]:
+                        click.secho(f"  │             {line:<33}│")
+                else:
+                    click.secho(f"  │  Crons:      {cron_str:<33}│")
+            else:
+                click.secho("  │  Crons:      none                            │")
+            if self.choices.user_name:
+                click.secho(f"  │  User:       {self.choices.user_name:<33}│")
+            click.secho(f"  │  Timezone:   {self.choices.timezone:<33}│")
+        else:
+            task_preview = self.choices.task_description[:30] + "..." if len(self.choices.task_description) > 33 else self.choices.task_description
+            click.secho(f"  │  Task:       {task_preview:<33}│")
+
+        click.secho("  └──────────────────────────────────────────────┘", dim=True)
+        click.echo()
+        click.secho(
+            "  This will create config.yaml, config.local.yaml (with\n"
+            "  your API keys), workspace files, and cron configuration.",
+            dim=True,
+        )
+        click.echo()
+
+        if not click.confirm("  Apply this configuration?", default=True):
+            if click.confirm("  Restart setup?", default=True):
+                # Re-run the whole wizard
+                self.choices = SetupChoices()
+                self.run()
+                raise SystemExit(0)
+            else:
+                click.secho("  Aborted.", fg="yellow")
+                raise SystemExit(0)
+
+    # --- Apply ---
+
+    def _apply(self) -> None:
+        click.echo()
+
+        # 1. Create workspace from templates
+        click.echo("  Creating workspace...", nl=False)
+        ws_path = Path(os.path.expanduser(str(self.choices.workspace_path)))
+        created = initialize_workspace(ws_path, self.choices.mode)
+        click.secho(" ✓", fg="green")
+
+        # 2. Patch USER.md with name/timezone if provided (personal mode)
+        if self.choices.mode == "personal" and self.choices.user_name:
+            user_md = ws_path / "USER.md"
+            if user_md.exists():
+                content = user_md.read_text(encoding="utf-8")
+                content = content.replace("{{USER_NAME}}", self.choices.user_name)
+                content = content.replace("{{TIMEZONE}}", self.choices.timezone)
+                user_md.write_text(content, encoding="utf-8")
+
+        # 3. Write TASK.md for worker mode
+        if self.choices.mode == "worker" and self.choices.task_description:
+            task_md = ws_path / "TASK.md"
+            task_md.write_text(
+                f"# Task\n\n{self.choices.task_description}\n",
+                encoding="utf-8",
+            )
+
+        # 4. Write config.yaml
+        click.echo("  Writing config.yaml...", nl=False)
+        self._write_config_yaml()
+        click.secho(" ✓", fg="green")
+
+        # 5. Write config.local.yaml
+        click.echo("  Writing config.local.yaml...", nl=False)
+        self._write_config_local_yaml()
+        click.secho(" ✓", fg="green")
+
+        # 6. Create ~/.nerve directory structure
+        click.echo("  Setting up ~/.nerve/...", nl=False)
+        nerve_dir = Path("~/.nerve").expanduser()
+        nerve_dir.mkdir(parents=True, exist_ok=True)
+        (nerve_dir / "cron").mkdir(parents=True, exist_ok=True)
+        click.secho(" ✓", fg="green")
+
+        # 7. Write cron jobs
+        click.echo("  Configuring cron jobs...", nl=False)
+        self._write_cron_jobs()
+        click.secho(" ✓", fg="green")
+
+    def _write_config_yaml(self) -> None:
+        """Write the base config.yaml."""
+        ws = str(self.choices.workspace_path)
+        tz = self.choices.timezone
+
+        config: dict[str, Any] = {
+            "workspace": ws,
+            "timezone": tz,
+            "agent": {
+                "model": "claude-opus-4-6",
+                "cron_model": "claude-sonnet-4-6",
+                "max_turns": 50,
+                "max_concurrent": 4,
+                "thinking": "max",
+                "effort": "max",
+                "context_1m": True,
+            },
+            "gateway": {
+                "host": "0.0.0.0",
+                "port": 8900,
+            },
+            "quiet_start": "02:00",
+            "quiet_end": "08:00",
+            "memory": {
+                "recall_model": "claude-sonnet-4-6",
+                "memorize_model": "claude-sonnet-4-6",
+                "fast_model": "claude-haiku-4-5-20251001",
+                "embed_model": "text-embedding-3-small",
+            },
+            "cron": {
+                "jobs_file": "~/.nerve/cron/jobs.yaml",
+            },
+            "sessions": {
+                "sticky_period_minutes": 120,
+                "archive_after_days": 30,
+                "max_sessions": 500,
+                "memorize_interval_minutes": 30,
+            },
+        }
+
+        if self.choices.mode == "personal":
+            config["telegram"] = {
+                "enabled": bool(self.choices.telegram_bot_token),
+                "dm_policy": "pairing",
+                "stream_mode": "partial",
+            }
+            config["sync"] = {
+                "telegram": {"enabled": False},
+                "gmail": {"enabled": False, "accounts": []},
+                "github": {"enabled": False},
+            }
+
+        config_path = self.config_dir / "config.yaml"
+        with open(config_path, "w") as f:
+            f.write("# Nerve — Configuration\n")
+            f.write("# Edit this file to customize Nerve's behavior.\n")
+            f.write("# Secrets (API keys, tokens) go in config.local.yaml.\n\n")
+            yaml.safe_dump(config, f, default_flow_style=False, sort_keys=False)
+
+    def _write_config_local_yaml(self) -> None:
+        """Write config.local.yaml with secrets."""
+        local: dict[str, Any] = {
+            "anthropic_api_key": self.choices.anthropic_api_key,
+        }
+
+        if self.choices.openai_api_key:
+            local["openai_api_key"] = self.choices.openai_api_key
+
+        if self.choices.telegram_bot_token:
+            local["telegram"] = {
+                "bot_token": self.choices.telegram_bot_token,
+            }
+
+        # Generate JWT secret for auth
+        local["auth"] = {
+            "jwt_secret": secrets.token_hex(32),
+        }
+
+        local_path = self.config_dir / "config.local.yaml"
+        with open(local_path, "w") as f:
+            f.write("# Nerve — Secrets (gitignored)\n")
+            f.write("# API keys, tokens, and other sensitive configuration.\n\n")
+            yaml.safe_dump(local, f, default_flow_style=False, sort_keys=False)
+
+        # Set restrictive permissions on the secrets file
+        try:
+            os.chmod(local_path, 0o600)
+        except OSError:
+            pass  # Best-effort on platforms that don't support chmod
+
+    def _write_cron_jobs(self) -> None:
+        """Write the cron jobs.yaml file."""
+        jobs: list[dict[str, Any]] = []
+
+        # Core crons (always enabled)
+        for cron in CORE_CRONS:
+            jobs.append({
+                "id": cron["id"],
+                "schedule": cron["schedule"],
+                "prompt": cron["prompt"],
+                "description": cron["description"],
+                "model": cron.get("model", ""),
+                "session_mode": cron.get("session_mode", "isolated"),
+                "enabled": True,
+            })
+
+        # Productivity crons
+        for cron in PRODUCTIVITY_CRONS:
+            enabled = cron["id"] in self.choices.enabled_crons
+            job: dict[str, Any] = {
+                "id": cron["id"],
+                "schedule": cron["schedule"],
+                "prompt": cron["prompt"],
+                "description": cron["description"],
+                "model": cron.get("model", ""),
+                "session_mode": cron.get("session_mode", "isolated"),
+                "enabled": enabled,
+            }
+            if cron.get("context_rotate_hours"):
+                job["context_rotate_hours"] = cron["context_rotate_hours"]
+            if cron.get("reminder_mode"):
+                job["reminder_mode"] = cron["reminder_mode"]
+            jobs.append(job)
+
+        jobs_file = Path("~/.nerve/cron/jobs.yaml").expanduser()
+        jobs_file.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(jobs_file, "w") as f:
+            f.write("# Nerve — Cron Jobs\n")
+            f.write("# Managed by 'nerve init'. Edit freely — Nerve won't overwrite.\n\n")
+            yaml.safe_dump({"jobs": jobs}, f, default_flow_style=False, sort_keys=False)
+
+    # --- Done ---
+
+    def _done(self) -> None:
+        click.echo()
+        click.secho("  ✅ Nerve is configured!", fg="green", bold=True)
+        click.echo()
+        click.secho("  Next steps:", bold=True)
+        click.echo("    nerve start              Start the server")
+        click.echo("    nerve start -f           Start in foreground (see logs)")
+        click.echo("    nerve doctor             Verify everything is set up")
+        click.echo("    http://localhost:8900     Open the web UI")
+        click.echo()
+        ws = os.path.expanduser(str(self.choices.workspace_path))
+        click.secho(f"  Your workspace: {ws}", bold=True)
+        click.echo("    Edit SOUL.md to customize Nerve's personality")
+        click.echo("    Edit USER.md to tell Nerve about yourself")
+        click.echo()
+        click.secho(
+            "  Tip: Nerve learns from every conversation. The more\n"
+            "  you interact, the more useful it becomes.",
+            dim=True,
+        )
+        click.echo()
+
+
+# --- Non-interactive mode ---
+
+
+def run_non_interactive(config_dir: Path) -> SetupChoices:
+    """Non-interactive setup using environment variables. For Docker."""
+    choices = SetupChoices()
+
+    # Required
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        raise click.ClickException("ANTHROPIC_API_KEY environment variable is required for non-interactive setup")
+    choices.anthropic_api_key = api_key
+
+    # Optional
+    choices.mode = os.environ.get("NERVE_MODE", "personal")
+    choices.openai_api_key = os.environ.get("OPENAI_API_KEY", "")
+    choices.workspace_path = Path(os.environ.get("NERVE_WORKSPACE", "~/nerve-workspace"))
+    choices.timezone = os.environ.get("NERVE_TIMEZONE", "America/New_York")
+    choices.telegram_bot_token = os.environ.get("NERVE_TELEGRAM_BOT_TOKEN", "")
+
+    # In non-interactive personal mode, enable inbox-processor and task-planner by default
+    if choices.mode == "personal":
+        choices.enabled_crons = ["inbox-processor", "task-planner"]
+    # Worker mode: no productivity crons by default
+
+    # Worker task description
+    if choices.mode == "worker":
+        choices.task_description = os.environ.get("NERVE_TASK", "")
+
+    wizard = SetupWizard(config_dir)
+    wizard.choices = choices
+
+    click.echo("Running non-interactive setup...")
+    wizard._apply()
+    click.echo("Setup complete.")
+
+    return choices
+
+
+# --- Detection ---
+
+
+def is_fresh_install(config_dir: Path) -> bool:
+    """Check if this is a fresh install (no config.local.yaml)."""
+    return not (config_dir / "config.local.yaml").exists()
+
+
+# --- Utilities ---
+
+
+def _wrap_text(text: str, width: int = 51) -> list[str]:
+    """Simple word-wrap for box formatting."""
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        if current and len(current) + 1 + len(word) > width:
+            lines.append(current)
+            current = word
+        elif current:
+            current += " " + word
+        else:
+            current = word
+    if current:
+        lines.append(current)
+    return lines or [""]

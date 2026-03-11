@@ -1,0 +1,29 @@
+import { useState } from 'react';
+import { ChevronRight, ChevronDown, Brain } from 'lucide-react';
+
+export function ThinkingBlock({ content, streaming }: { content: string; streaming?: boolean }) {
+  const [expanded, setExpanded] = useState(false);
+  const preview = content.split('\n')[0].slice(0, 100);
+
+  return (
+    <div className="my-2 border-l-2 border-[#3a3a50] bg-[#12121a] rounded-r-md">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="flex items-center gap-2 w-full px-3 py-2 text-left cursor-pointer hover:bg-[#16162a] rounded-r-md transition-colors"
+      >
+        <Brain size={14} className="text-[#6366f1] shrink-0" />
+        {expanded ? <ChevronDown size={14} className="text-[#555]" /> : <ChevronRight size={14} className="text-[#555]" />}
+        <span className="text-[13px] text-[#777] italic truncate">
+          {expanded ? 'Thinking' : preview || 'Thinking...'}
+        </span>
+        {streaming && <span className="streaming-cursor inline-block w-1.5 h-3.5 bg-[#6366f1] ml-1 shrink-0" />}
+      </button>
+      {expanded && (
+        <div className="px-4 pb-3 text-[13px] text-[#888] italic whitespace-pre-wrap leading-relaxed">
+          {content}
+          {streaming && <span className="streaming-cursor inline-block w-1.5 h-3.5 bg-[#6366f1] ml-0.5 align-text-bottom" />}
+        </div>
+      )}
+    </div>
+  );
+}

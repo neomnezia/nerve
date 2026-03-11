@@ -1,0 +1,74 @@
+import { useState } from 'react';
+import { ChevronRight, ChevronDown, Terminal, FileText, Search, Globe, Loader2 } from 'lucide-react';
+import type { ToolCallGroup } from '../../types/renderBlocks';
+import { ToolCallBlock } from './ToolCallBlock';
+
+const TOOL_ICONS: Record<string, typeof Terminal> = {
+  Bash: Terminal,
+  Read: FileText,
+  Write: FileText,
+  Edit: FileText,
+  Grep: Search,
+  Glob: Search,
+  WebSearch: Globe,
+  WebFetch: Globe,
+};
+
+/** How many items to always show at the bottom of a collapsed group. */
+const VISIBLE_TAIL = 3;
+
+export function ToolCallGroupBlock({ group }: { group: ToolCallGroup }) {
+  const [expanded, setExpanded] = useState(false);
+  const { tool, blocks } = group;
+
+  const total = blocks.length;
+  const hiddenCount = Math.max(0, total - VISIBLE_TAIL);
+  const needsCollapsing = hiddenCount > 0;
+
+  const Icon = TOOL_ICONS[tool] || Terminal;
+  const hasRunning = blocks.some(b => b.status === 'running');
+  const hasError = blocks.some(b => b.isError);
+
+  const hiddenBlocks = needsCollapsing ? blocks.slice(0, hiddenCount) : [];
+  const visibleBlocks = needsCollapsing ? blocks.slice(hiddenCount) : blocks;
+
+  return (
+    <div className="my-0.5">
+      {/* Collapse bar — only shown for groups of 4+ */}
+      {needsCollapsing && (
+        <button
+          onClick={() => setExpanded(!expanded)}
+          className="flex items-center gap-2 w-full px-3 py-1.5 text-left cursor-pointer
+                     text-[12px] text-[#555] hover:text-[#888] hover:bg-[#1a1a1a]
+                     rounded-md transition-colors"
+        >
+          {hasRunning
+            ? <Loader2 size={12} className="text-[#6366f1] animate-spin shrink-0" />
+            : <Icon size={12} className={`shrink-0 ${hasError ? 'text-red-400' : 'text-[#555]'}`} />
+          }
+          <span className="font-mono font-medium">
+            {expanded ? 'Collapse' : `Show ${hiddenCount} more`}
+          </span>
+          <span className="text-[#444]">·</span>
+          <span className="text-[#444]">{total} {tool} calls</span>
+          <div className="ml-auto shrink-0">
+            {expanded
+              ? <ChevronDown size={12} className="text-[#444]" />
+              : <ChevronRight size={12} className="text-[#444]" />
+            }
+          </div>
+        </button>
+      )}
+
+      {/* Expanded hidden items */}
+      {expanded && hiddenBlocks.map((block) => (
+        <ToolCallBlock key={block.toolUseId} block={block} />
+      ))}
+
+      {/* Always-visible tail (last 3, or all if total <= 3) */}
+      {visibleBlocks.map((block) => (
+        <ToolCallBlock key={block.toolUseId} block={block} />
+      ))}
+    </div>
+  );
+}

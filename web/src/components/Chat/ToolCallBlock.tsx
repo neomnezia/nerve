@@ -1,0 +1,128 @@
+import { useState } from 'react';
+import { ChevronRight, ChevronDown, Terminal, FileText, Search, Globe, Loader2 } from 'lucide-react';
+import { getToolSummary } from '../../utils/toolSummary';
+import type { ToolCallBlockData } from '../../types/chat';
+import { EditToolBlock } from './tools/EditToolBlock';
+import { BashToolBlock } from './tools/BashToolBlock';
+import { FileToolBlock } from './tools/FileToolBlock';
+import { MemoryToolBlock } from './tools/MemoryToolBlock';
+import { TaskToolBlock } from './tools/TaskToolBlock';
+import { SourceToolBlock } from './tools/SourceToolBlock';
+import { SubagentToolBlock } from './tools/SubagentToolBlock';
+import { QuestionBlock } from './tools/QuestionBlock';
+import { PlanApprovalBlock } from './tools/PlanApprovalBlock';
+import { PlanToolBlock } from './tools/PlanToolBlock';
+import { SkillToolBlock } from './tools/SkillToolBlock';
+import { NotificationToolBlock } from './tools/NotificationToolBlock';
+
+const TOOL_ICONS: Record<string, typeof Terminal> = {
+  Bash: Terminal,
+  Read: FileText,
+  Write: FileText,
+  Edit: FileText,
+  Grep: Search,
+  Glob: Search,
+  WebSearch: Globe,
+  WebFetch: Globe,
+};
+
+export function ToolCallBlock({ block }: { block: ToolCallBlockData }) {
+  // Route to specialized renderers
+  switch (block.tool) {
+    case 'Edit':
+      return <EditToolBlock block={block} />;
+    case 'Bash':
+      return <BashToolBlock block={block} />;
+    case 'Read':
+    case 'Write':
+      return <FileToolBlock block={block} />;
+    case 'Task':
+      return <SubagentToolBlock block={block} />;
+    case 'AskUserQuestion':
+      return <QuestionBlock block={block} />;
+    case 'ExitPlanMode':
+    case 'EnterPlanMode':
+      return <PlanApprovalBlock block={block} />;
+  }
+
+  // Notification tools
+  if (block.tool.includes('notify') || block.tool.includes('ask_user')) {
+    return <NotificationToolBlock block={block} />;
+  }
+
+  // MCP tool routing by name pattern
+  if (block.tool.includes('list_sources') || block.tool.includes('poll_source') || block.tool.includes('poll_all') || block.tool.includes('read_source')) {
+    return <SourceToolBlock block={block} />;
+  }
+  if (block.tool.includes('memory') || block.tool.includes('memorize') || block.tool.includes('recall') || block.tool.includes('conversation_history') || block.tool.includes('sync_status')) {
+    return <MemoryToolBlock block={block} />;
+  }
+  if (block.tool.includes('plan_propose') || block.tool.includes('plan_list')) {
+    return <PlanToolBlock block={block} />;
+  }
+  if (block.tool.includes('skill_list') || block.tool.includes('skill_get') || block.tool.includes('skill_read_reference') || block.tool.includes('skill_run_script') || block.tool.includes('skill_create') || block.tool.includes('skill_update')) {
+    return <SkillToolBlock block={block} />;
+  }
+  if (block.tool.includes('task_')) {
+    return <TaskToolBlock block={block} />;
+  }
+
+  // Generic fallback
+  return <GenericToolBlock block={block} />;
+}
+
+function GenericToolBlock({ block }: { block: ToolCallBlockData }) {
+  const [expanded, setExpanded] = useState(false);
+  const Icon = TOOL_ICONS[block.tool] || Terminal;
+  const summary = getToolSummary(block.tool, block.input);
+  const isRunning = block.status === 'running';
+
+  return (
+    <div className="my-1.5 border border-[#2a2a2a] rounded-lg bg-[#141414] overflow-hidden">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="flex items-center gap-2 w-full px-3 py-2 text-left cursor-pointer hover:bg-[#1a1a1a] transition-colors"
+      >
+        {isRunning
+          ? <Loader2 size={14} className="text-[#6366f1] animate-spin shrink-0" />
+          : <Icon size={14} className={`shrink-0 ${block.isError ? 'text-red-400' : 'text-[#888]'}`} />
+        }
+        <span className="text-[13px] font-mono font-medium text-[#ccc]">{block.tool}</span>
+        {summary && <span className="text-[12px] text-[#666] truncate font-mono">{summary}</span>}
+        <div className="ml-auto shrink-0">
+          {expanded ? <ChevronDown size={14} className="text-[#555]" /> : <ChevronRight size={14} className="text-[#555]" />}
+        </div>
+      </button>
+
+      {expanded && (
+        <div className="border-t border-[#2a2a2a]">
+          {/* Input */}
+          <div className="px-3 py-2">
+            <div className="text-[10px] uppercase tracking-wider text-[#555] mb-1">Input</div>
+            <pre className="text-[12px] text-[#999] font-mono whitespace-pre-wrap overflow-x-auto max-h-60 overflow-y-auto bg-[#0f0f0f] rounded p-2 border border-[#222]">
+              {JSON.stringify(block.input, null, 2)}
+            </pre>
+          </div>
+
+          {/* Result */}
+          {block.result !== undefined && (
+            <div className="px-3 py-2 border-t border-[#222]">
+              <div className="text-[10px] uppercase tracking-wider text-[#555] mb-1">
+                {block.isError ? 'Error' : 'Result'}
+              </div>
+              <pre className={`text-[12px] font-mono whitespace-pre-wrap overflow-x-auto max-h-80 overflow-y-auto bg-[#0f0f0f] rounded p-2 border border-[#222] ${block.isError ? 'text-red-400' : 'text-[#999]'}`}>
+                {block.result}
+              </pre>
+            </div>
+          )}
+
+          {isRunning && block.result === undefined && (
+            <div className="px-3 py-3 text-[12px] text-[#666] flex items-center gap-2 border-t border-[#222]">
+              <Loader2 size={12} className="animate-spin" /> Running...
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
