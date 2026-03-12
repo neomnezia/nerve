@@ -53,8 +53,8 @@ class CronService:
 
     async def start(self) -> None:
         """Load jobs and start the scheduler."""
-        # Load job definitions
-        self._jobs = load_jobs(self.config.cron.jobs_file)
+        # Load job definitions from both files
+        self._jobs = self._load_merged_jobs()
 
         # Register cron jobs
         for job in self._jobs:
@@ -181,6 +181,51 @@ class CronService:
         )
         return True
 
+    def _load_merged_jobs(self) -> list[CronJob]:
+        """Load and merge jobs from system.yaml and jobs.yaml.
+
+        System jobs come from system.yaml (managed by `nerve init`).
+        User jobs come from jobs.yaml (user-defined, never touched by Nerve).
+        If a user job has the same ID as a system job, the user version wins.
+        """
+        system_file = self.config.cron.system_file
+        jobs_file = self.config.cron.jobs_file
+
+        system_jobs = load_jobs(system_file)
+        user_jobs = load_jobs(jobs_file)
+
+        if not system_jobs and user_jobs:
+            # Backward compat: old install with everything in jobs.yaml
+            logger.info(
+                "No system.yaml found — loading all crons from jobs.yaml "
+                "(run 'nerve init' to split)"
+            )
+            # Tag all as user-sourced (no system file yet)
+            for j in user_jobs:
+                j.metadata["_source"] = "user"
+            return user_jobs
+
+        # Tag sources for display in CLI
+        for j in system_jobs:
+            j.metadata["_source"] = "system"
+        for j in user_jobs:
+            j.metadata["_source"] = "user"
+
+        # Merge: user jobs override system jobs with same ID
+        system_ids = {j.id for j in system_jobs}
+        for job in user_jobs:
+            if job.id in system_ids:
+                logger.warning(
+                    "User job '%s' shadows system job — user version used",
+                    job.id,
+                )
+
+        jobs_by_id = {j.id: j for j in system_jobs}
+        for j in user_jobs:
+            jobs_by_id[j.id] = j
+
+        return list(jobs_by_id.values())
+
     async def _run_job_wrapper(self, job: CronJob) -> None:
         """Wrapper to run a cron job with logging."""
         log_id = await self.db.log_cron_start(job.id)
@@ -294,8 +339,8 @@ class CronService:
         """Run a specific job manually (used by CLI)."""
         job = next((j for j in self._jobs if j.id == job_id), None)
         if not job:
-            # Try loading fresh
-            self._jobs = load_jobs(self.config.cron.jobs_file)
+            # Try loading fresh from both files
+            self._jobs = self._load_merged_jobs()
             job = next((j for j in self._jobs if j.id == job_id), None)
 
         if not job:
@@ -314,7 +359,7 @@ class CronService:
         """
         job = next((j for j in self._jobs if j.id == job_id), None)
         if not job:
-            self._jobs = load_jobs(self.config.cron.jobs_file)
+            self._jobs = self._load_merged_jobs()
             job = next((j for j in self._jobs if j.id == job_id), None)
 
         if not job:
@@ -366,6 +411,7 @@ class CronService:
             result.append({
                 "id": job.id,
                 "type": "cron",
+                "source": job.metadata.get("_source", "unknown"),
                 "schedule": job.schedule,
                 "description": job.description,
                 "enabled": job.enabled,

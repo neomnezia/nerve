@@ -721,6 +721,7 @@ class SetupWizard:
                 "embed_model": "text-embedding-3-small",
             },
             "cron": {
+                "system_file": "~/.nerve/cron/system.yaml",
                 "jobs_file": "~/.nerve/cron/jobs.yaml",
             },
             "sessions": {
@@ -782,7 +783,7 @@ class SetupWizard:
             pass  # Best-effort on platforms that don't support chmod
 
     def _write_cron_jobs(self) -> None:
-        """Write the cron jobs.yaml file."""
+        """Write system crons to system.yaml and scaffold jobs.yaml for user crons."""
         jobs: list[dict[str, Any]] = []
 
         # Core crons (always enabled)
@@ -815,13 +816,24 @@ class SetupWizard:
                 job["reminder_mode"] = cron["reminder_mode"]
             jobs.append(job)
 
-        jobs_file = Path("~/.nerve/cron/jobs.yaml").expanduser()
-        jobs_file.parent.mkdir(parents=True, exist_ok=True)
+        # Write system crons (managed by nerve init, safe to regenerate)
+        system_file = Path("~/.nerve/cron/system.yaml").expanduser()
+        system_file.parent.mkdir(parents=True, exist_ok=True)
 
-        with open(jobs_file, "w") as f:
-            f.write("# Nerve — Cron Jobs\n")
-            f.write("# Managed by 'nerve init'. Edit freely — Nerve won't overwrite.\n\n")
+        with open(system_file, "w") as f:
+            f.write("# Nerve — System Cron Jobs\n")
+            f.write("# Managed by 'nerve init'. Safe to re-generate.\n")
+            f.write("# To add custom crons, use jobs.yaml instead.\n\n")
             yaml.safe_dump({"jobs": jobs}, f, default_flow_style=False, sort_keys=False)
+
+        # Create empty jobs.yaml scaffold if it doesn't exist
+        jobs_file = Path("~/.nerve/cron/jobs.yaml").expanduser()
+        if not jobs_file.exists():
+            with open(jobs_file, "w") as f:
+                f.write("# Nerve — Custom Cron Jobs\n")
+                f.write("# Add your own cron jobs here. Nerve will never overwrite this file.\n")
+                f.write("# Format is the same as system.yaml — see it for examples.\n\n")
+                f.write("jobs: []\n")
 
     # --- Done ---
 

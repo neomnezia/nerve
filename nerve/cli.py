@@ -438,11 +438,30 @@ def doctor(ctx: click.Context) -> None:
     else:
         click.echo(f"[--] Database will be created at: {db_path}")
 
-    # Check cron jobs
-    if config.cron.jobs_file.exists():
-        click.echo(f"[OK] Cron jobs file: {config.cron.jobs_file}")
+    # Check cron files
+    if config.cron.system_file.exists():
+        try:
+            from nerve.cron.jobs import load_jobs
+            system_jobs = load_jobs(config.cron.system_file)
+            enabled = sum(1 for j in system_jobs if j.enabled)
+            click.echo(f"[OK] System crons: {config.cron.system_file} ({enabled}/{len(system_jobs)} enabled)")
+        except Exception:
+            click.echo(f"[OK] System crons: {config.cron.system_file}")
     else:
-        click.echo(f"[--] No cron jobs file at: {config.cron.jobs_file}")
+        click.echo(f"[--] No system crons at: {config.cron.system_file}")
+
+    if config.cron.jobs_file.exists():
+        try:
+            from nerve.cron.jobs import load_jobs as _load_jobs
+            user_jobs = _load_jobs(config.cron.jobs_file)
+            if user_jobs:
+                click.echo(f"[OK] User crons: {config.cron.jobs_file} ({len(user_jobs)} jobs)")
+            else:
+                click.echo(f"[OK] User crons: {config.cron.jobs_file} (empty)")
+        except Exception:
+            click.echo(f"[OK] User crons: {config.cron.jobs_file}")
+    else:
+        click.echo(f"[--] No user crons at: {config.cron.jobs_file}")
 
     # Check external tools
     import shutil
@@ -584,9 +603,27 @@ def cron(ctx: click.Context, job_id: str) -> None:
             else:
                 click.echo("Available jobs:")
                 from nerve.cron.jobs import load_jobs
-                jobs = load_jobs(config.cron.jobs_file)
-                for job in jobs:
-                    click.echo(f"  {job.id}: {job.description or job.schedule}")
+
+                # Load from both files, show provenance
+                system_jobs = load_jobs(config.cron.system_file)
+                user_jobs = load_jobs(config.cron.jobs_file)
+
+                # Merge (user overrides system)
+                seen_ids: set[str] = set()
+                all_jobs: list[tuple[str, Any]] = []  # (source_label, job)
+                for j in user_jobs:
+                    seen_ids.add(j.id)
+                    all_jobs.append(("user", j))
+                for j in system_jobs:
+                    if j.id not in seen_ids:
+                        all_jobs.append(("system", j))
+
+                for source, job in all_jobs:
+                    status = "enabled" if job.enabled else "disabled"
+                    click.echo(
+                        f"  [{source:6s}] {job.id}: "
+                        f"{job.description or job.schedule} ({status})"
+                    )
         finally:
             await close_db()
 

@@ -4,11 +4,25 @@
 
 Nerve uses APScheduler for in-process async job scheduling. Jobs can run in isolated sessions (fresh each time) or persistent sessions (context preserved across runs) and deliver output to configured channels.
 
+## Two-File Layout
+
+Cron jobs live in two YAML files under `~/.nerve/cron/`:
+
+| File | Purpose | Managed by |
+|------|---------|------------|
+| `system.yaml` | Built-in crons (core + productivity) | `nerve init` — safe to regenerate |
+| `jobs.yaml` | Your custom crons | You — Nerve never touches this file |
+
+Both files use the same format. On startup, CronService loads and merges both:
+- If a job ID appears in both files, the **user version wins** (with a warning in the log).
+- Old installs with everything in `jobs.yaml` still work — if `system.yaml` doesn't exist, all jobs load from `jobs.yaml`.
+
+Running `nerve init` on an existing install regenerates `system.yaml` (e.g., to pick up updated prompts from a Nerve update) without touching `jobs.yaml`.
+
 ## Job Definition
 
-Jobs are defined in a YAML file (default: `~/.nerve/cron/jobs.yaml`):
-
 ```yaml
+# ~/.nerve/cron/jobs.yaml (or system.yaml — same format)
 jobs:
   - id: morning-briefing
     schedule: "30 11 * * *"        # 11:30 AM daily
@@ -85,11 +99,19 @@ Jobs with `session_mode: main` run in the main user session instead of an isolat
 ## CLI Usage
 
 ```bash
+# List available jobs (shows source and status)
+nerve cron
+#   [system] memory-maintenance: Daily memory cleanup (enabled)
+#   [system] inbox-processor: Polls sources every 30 min (enabled)
+#   [user  ] my-custom-monitor: Checks CI status (enabled)
+
 # Run a specific job manually
 nerve cron morning-briefing
 
-# List available jobs
-nerve cron
+# Check cron status
+nerve doctor
+#   [OK] System crons: ~/.nerve/cron/system.yaml (3/5 enabled)
+#   [OK] User crons: ~/.nerve/cron/jobs.yaml (1 jobs)
 ```
 
 ## Built-in Jobs

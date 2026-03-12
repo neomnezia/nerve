@@ -124,4 +124,5 @@ Sources pull data from external services on a schedule. See [sources.md](sources
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `cron.jobs_file` | path | `~/.nerve/cron/jobs.yaml` | Cron job definitions |
+| `cron.system_file` | path | `~/.nerve/cron/system.yaml` | System cron jobs (managed by `nerve init`) |
+| `cron.jobs_file` | path | `~/.nerve/cron/jobs.yaml` | User-defined custom cron jobs |

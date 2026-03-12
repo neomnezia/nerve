@@ -267,11 +267,13 @@ class MemoryConfig:
 @dataclass
 class CronConfig:
     jobs_file: Path = field(default_factory=lambda: Path("~/.nerve/cron/jobs.yaml"))
+    system_file: Path = field(default_factory=lambda: Path("~/.nerve/cron/system.yaml"))
 
     @classmethod
     def from_dict(cls, d: dict) -> CronConfig:
         return cls(
             jobs_file=_expand_path(d.get("jobs_file", "~/.nerve/cron/jobs.yaml")) or Path("~/.nerve/cron/jobs.yaml"),
+            system_file=_expand_path(d.get("system_file", "~/.nerve/cron/system.yaml")) or Path("~/.nerve/cron/system.yaml"),
         )
 
 

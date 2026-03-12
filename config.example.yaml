@@ -50,4 +50,5 @@ memory:
 
 # Cron
 cron:
-  jobs_file: ~/.nerve/cron/jobs.yaml
+  system_file: ~/.nerve/cron/system.yaml   # Managed by 'nerve init' — system crons
+  jobs_file: ~/.nerve/cron/jobs.yaml       # Your custom crons — never touched by Nerve
