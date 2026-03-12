@@ -983,13 +983,18 @@ class MemUBridge:
             try:
                 client = self._service._get_llm_base_client(profile)
 
-                # --- Layer 1: httpx timeout ---
+                # --- Layer 1: httpx timeout + disable SDK retries ---
                 inner = getattr(client, "client", None)  # OpenAISDKClient.client = AsyncOpenAI
                 if inner is not None:
                     inner.timeout = _httpx.Timeout(
                         self._LLM_CALL_TIMEOUT,
                         connect=10.0,
                     )
+                    # The OpenAI SDK defaults to max_retries=2 and 600s timeout.
+                    # With our 120s asyncio.wait_for wrapper, SDK retries just
+                    # waste time inside a doomed coroutine.  Disable them so the
+                    # httpx timeout fires cleanly and propagates immediately.
+                    inner.max_retries = 0
 
                 # --- Layer 2: asyncio.wait_for wrapper ---
                 if not callable(getattr(client, "chat", None)):
@@ -1003,6 +1008,7 @@ class MemUBridge:
                     prompt, *, max_tokens=None, system_prompt=None, temperature=0.2,
                     _orig=original_chat, _prof=profile,
                 ):
+                    t0 = time.monotonic()
                     try:
                         return await asyncio.wait_for(
                             _orig(
@@ -1014,15 +1020,24 @@ class MemUBridge:
                             timeout=self._LLM_CALL_TIMEOUT,
                         )
                     except asyncio.TimeoutError:
-                        # Log with enough context to diagnose.  Include the
-                        # number of in-flight memorize ops — concurrent calls
-                        # sharing one API key can trigger rate-limiting.
+                        elapsed = time.monotonic() - t0
                         in_flight = len(self._metrics.in_flight)
+                        # Dump httpx connection pool state for diagnosis
+                        pool_info = "unknown"
+                        try:
+                            base = self._service._llm_clients.get(_prof)
+                            sdk = getattr(base, "client", None)
+                            transport = getattr(sdk, "_client", None)
+                            pool = getattr(transport, "_pool", None) or getattr(transport, "_transport", None)
+                            if pool:
+                                pool_info = repr(pool)
+                        except Exception:
+                            pass
                         logger.error(
-                            "memU LLM HUNG [%s]: no response after %ds "
-                            "(prompt=%d chars, in_flight=%d)",
-                            _prof, self._LLM_CALL_TIMEOUT, len(prompt),
-                            in_flight,
+                            "memU LLM HUNG [%s]: no response after %.0fs "
+                            "(prompt=%d chars, in_flight=%d, pool=%s)",
+                            _prof, elapsed, len(prompt),
+                            in_flight, pool_info,
                         )
                         raise
 
@@ -1114,6 +1129,25 @@ class MemUBridge:
                 logger.warning("Could not reset LLM client for '%s': %s", profile, e)
         # Re-apply per-call timeouts on the fresh clients
         self._instrument_llm_timeouts()
+
+        # Warm up the new clients — the first HTTP/2 request on a fresh
+        # AsyncOpenAI→httpx connection can stall.  A cheap throwaway call
+        # forces the connection open before the real memorize call.
+        for profile in ("memorize", "fast"):
+            try:
+                client = self._service._get_llm_base_client(profile)
+                if hasattr(client, "client"):
+                    await asyncio.wait_for(
+                        client.client.chat.completions.create(
+                            model=client.chat_model,
+                            messages=[{"role": "user", "content": "ping"}],
+                            max_tokens=1,
+                        ),
+                        timeout=15,
+                    )
+                    logger.info("Warmed up LLM client after reset: %s", profile)
+            except Exception as e:
+                logger.warning("LLM warmup after reset for %s: %s", profile, e)
 
     async def memorize_file(self, file_path: str, modality: str = "document", source: str = "bridge") -> bool:
         """Memorize a local file by its absolute path."""
