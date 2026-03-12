@@ -965,7 +965,7 @@ class SetupWizard:
 
             response = client.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=4096,
+                max_tokens=16384,
                 system=_SETUP_AGENT_PROMPT,
                 messages=[
                     {
@@ -978,6 +978,20 @@ class SetupWizard:
             )
 
             text = response.content[0].text
+
+            # Show brief status
+            click.secho(
+                f"  ✓ Got response ({response.usage.output_tokens} tokens, "
+                f"stop: {response.stop_reason})",
+                fg="green",
+            )
+
+            if response.stop_reason == "max_tokens":
+                raise ValueError(
+                    "Response was truncated (hit max_tokens). "
+                    "The task description may be too complex for a single setup call."
+                )
+
             return self._parse_setup_response(text)
         finally:
             if proxy is not None:
