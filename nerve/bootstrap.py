@@ -200,13 +200,13 @@ class SetupChoices:
     task_description: str = ""
 
 
-# --- Credential resolution (tachikoma-style waterfall) ---
+# --- Credential resolution (priority waterfall) ---
 
 
 def _resolve_claude_credential() -> tuple[str, str, list[str]]:
     """Resolve Claude credential from host. First match wins.
 
-    Waterfall (matches ClickHouse/tachikoma pattern):
+    Waterfall (priority cascade):
       1a. macOS Keychain "Claude Code-credentials" (OAuth JSON)
       1b. macOS Keychain "Claude Code" (raw API key)
       2.  CLAUDE_CODE_OAUTH_TOKEN env var
@@ -450,7 +450,7 @@ class SetupWizard:
         env vars to `docker compose run` and stored in config.local.yaml
         by the wizard inside the container.
 
-        Credential resolution follows the tachikoma waterfall pattern:
+        Credential resolution follows the priority waterfall pattern:
         first match wins, each source tried in priority order.
         """
         click.clear()
@@ -1588,7 +1588,7 @@ def run_non_interactive(config_dir: Path) -> SetupChoices:
     choices = SetupChoices()
 
     # API auth: OAuth token, API key, or proxy mode.
-    # Follows tachikoma-style waterfall — first match wins.
+    # Follows priority waterfall — first match wins.
     use_proxy = os.environ.get("NERVE_USE_PROXY", "") == "1"
     choices.use_proxy = use_proxy
 
@@ -1807,7 +1807,7 @@ if [ ! -d "web/dist" ]; then
     cd web && npm ci --quiet && npm run build && cd ..
 fi
 
-# --- Credential resolution (tachikoma-style waterfall) ---
+# --- Credential resolution (priority waterfall) ---
 # Export credentials from config.local.yaml so tools (claude CLI, gh CLI)
 # can authenticate inside Docker. macOS stores tokens in the Keychain
 # which Docker can't access — the bootstrap wizard extracts them during

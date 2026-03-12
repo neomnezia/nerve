@@ -179,19 +179,19 @@ Example 1: Filtering generic vs. project-specific knowledge
 ## Input
 [0] 2026-03-01T10:00:00 [user]: I need to hash passwords in my Flask app. Should I use bcrypt?
 [1] 2026-03-01T10:01:00 [assistant]: Yes, bcrypt is the standard choice for password hashing.
-[2] 2026-03-01T10:02:00 [user]: Got it. Also, I found that our Nerve deployment on the Pi has a weird issue where the first API call to Anthropic always hangs for 30+ seconds. Turns out it's an HTTP/2 negotiation problem with Cloudflare.
-[3] 2026-03-01T10:03:00 [assistant]: That's a known issue. You can work around it by sending a throwaway ping request at startup.
-[4] 2026-03-01T10:04:00 [user]: Yeah, we already do that in memu_bridge.py's initialize() method. Also, json.dumps doesn't handle numpy arrays, so we have to call .tolist() first.
+[2] 2026-03-01T10:02:00 [user]: Got it. Also, I found that our staging deployment has a weird issue where WebSocket connections drop after exactly 60 seconds. Turns out the load balancer has an idle timeout we need to override.
+[3] 2026-03-01T10:03:00 [assistant]: That's a common issue with cloud LBs. You can work around it by sending periodic ping frames.
+[4] 2026-03-01T10:04:00 [user]: Yeah, we already do that in ws_manager.py's keep_alive() method. Also, json.dumps doesn't handle numpy arrays, so we have to call .tolist() first.
 ## Output
 <item>
     <memory>
-        <content>On the Raspberry Pi, the first HTTP/2 request to Anthropic's API hangs for 30+ seconds due to a Cloudflare negotiation issue, requiring a warmup ping at startup</content>
+        <content>Staging WebSocket connections drop after 60 seconds due to load balancer idle timeout; requires periodic ping frames to keep connections alive</content>
         <categories>
             <category>Infrastructure</category>
         </categories>
     </memory>
     <memory>
-        <content>Nerve's memu_bridge.py initialize() method sends a warmup ping to work around the Anthropic HTTP/2 hang on first connection</content>
+        <content>ws_manager.py's keep_alive() method sends periodic WebSocket pings to prevent load balancer idle timeout disconnections</content>
         <categories>
             <category>Infrastructure</category>
         </categories>
@@ -200,18 +200,18 @@ Example 1: Filtering generic vs. project-specific knowledge
 ## Explanation
 - "bcrypt is for password hashing" — general CS knowledge, any developer knows this. NOT extracted.
 - "json.dumps doesn't handle numpy" — standard Python knowledge, well documented. NOT extracted.
-- HTTP/2 hang on Pi — non-obvious, environment-specific gotcha. EXTRACTED.
-- memu_bridge.py warmup workaround — project-specific architecture knowledge. EXTRACTED.
+- WebSocket drop on staging — non-obvious, environment-specific gotcha. EXTRACTED.
+- ws_manager.py keep_alive workaround — project-specific architecture knowledge. EXTRACTED.
 
 Example 2: Work-specific data SHOULD be extracted
 ## Input
-[0] 2026-03-12T09:00:00 [assistant]: ClickHouse CI Monitor found 3 new issues: #99258 ReadBuffer canceled (Mar 11), #99257 View bad result after re-attaching (Mar 11), #99195 Expected file not to exist (Mar 10). Also 5 libFuzzer tests consistently failing on NightlyFuzzers.
+[0] 2026-03-12T09:00:00 [assistant]: CI Monitor found 3 new issues: #1058 Connection pool exhaustion (Mar 11), #1057 Flaky pagination test (Mar 11), #1042 Missing index on users table (Mar 10). Also 2 integration tests consistently failing on NightlyBuilds.
 ## Output
 <item>
     <memory>
-        <content>ClickHouse CI Monitor tracked issues as of March 12, 2026: #99258 ReadBuffer canceled, #99257 View bad result after re-attaching, #99195 Expected file not to exist, plus 5 consistently failing libFuzzer tests on NightlyFuzzers</content>
+        <content>CI Monitor tracked issues as of March 12, 2026: #1058 Connection pool exhaustion, #1057 Flaky pagination test, #1042 Missing index on users table, plus 2 consistently failing integration tests on NightlyBuilds</content>
         <categories>
-            <category>ClickHouse</category>
+            <category>Work</category>
         </categories>
     </memory>
 </item>

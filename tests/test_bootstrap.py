@@ -535,7 +535,7 @@ class TestDockerTemplateIntegrity:
 
 
 class TestCredentialWaterfall:
-    """Test tachikoma-style credential resolution functions."""
+    """Test credential resolution waterfall functions."""
 
     def test_resolve_claude_from_oauth_env(self) -> None:
         """CLAUDE_CODE_OAUTH_TOKEN env var should be picked up."""
