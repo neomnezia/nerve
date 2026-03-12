@@ -138,7 +138,8 @@ class TestNonInteractiveSetup:
         assert (ws / "AGENTS.md").exists()
         # Personal-only files should NOT exist
         assert not (ws / "USER.md").exists()
-        assert not (ws / "MEMORY.md").exists()
+        # Worker mode now includes MEMORY.md for hot memory
+        assert (ws / "MEMORY.md").exists()
 
         # TASK.md should be created
         assert (ws / "TASK.md").exists()
