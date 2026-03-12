@@ -470,6 +470,8 @@ class TestDockerTemplateIntegrity:
         assert ".:/nerve" in volumes
         assert "~/.nerve:/root/.nerve" in volumes
         assert "~/.claude:/root/.claude" in volumes
+        assert "~/.config/gh:/root/.config/gh" in volumes
+        assert "~/.config/gog:/root/.config/gog" in volumes
         assert "~/my-workspace:/root/nerve-workspace" in volumes
         # No named volumes section
         assert "volumes" not in parsed or parsed.get("volumes") is None
