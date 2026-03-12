@@ -203,36 +203,84 @@ class SetupChoices:
 # --- Credential resolution (tachikoma-style waterfall) ---
 
 
-def _resolve_claude_credential() -> tuple[str, str]:
+def _resolve_claude_credential() -> tuple[str, str, list[str]]:
     """Resolve Claude credential from host. First match wins.
 
     Waterfall (matches ClickHouse/tachikoma pattern):
-      1. macOS Keychain ("Claude Code-credentials")
-      2. CLAUDE_CODE_OAUTH_TOKEN env var
-      3. ~/.claude/.credentials.json file
-      4. ANTHROPIC_API_KEY env var
+      1a. macOS Keychain "Claude Code-credentials" (OAuth JSON)
+      1b. macOS Keychain "Claude Code" (raw API key)
+      2.  CLAUDE_CODE_OAUTH_TOKEN env var
+      3.  ~/.claude/.credentials.json file
+      4.  ANTHROPIC_API_KEY env var
 
-    Returns (token_value, source_label). Empty string if nothing found.
+    Returns (token_value, source_label, debug_log).
+    debug_log contains details about each step tried, useful when nothing is found.
     """
-    # 1. macOS Keychain
+    debug: list[str] = []
+
+    # 1a. macOS Keychain — OAuth entry ("Claude Code-credentials")
+    #     This is where `claude login` stores OAuth tokens on macOS.
+    #     The value is a JSON blob; we extract claudeAiOauth.accessToken.
     if sys.platform == "darwin" and shutil.which("security"):
+        try:
+            result = subprocess.run(
+                ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                raw = result.stdout.strip()
+                try:
+                    data = json.loads(raw)
+                    token = data.get("claudeAiOauth", {}).get("accessToken", "")
+                    if token:
+                        debug.append('keychain "Claude Code-credentials": found OAuth token')
+                        return (token, "macOS Keychain (OAuth)", debug)
+                    debug.append(
+                        'keychain "Claude Code-credentials": JSON parsed but no '
+                        f"claudeAiOauth.accessToken (keys: {list(data.keys())})"
+                    )
+                except json.JSONDecodeError:
+                    # Not JSON — use raw value as-is (unlikely but handle gracefully)
+                    debug.append(
+                        'keychain "Claude Code-credentials": not JSON, using raw value'
+                    )
+                    return (raw, "macOS Keychain (credentials)", debug)
+            else:
+                debug.append(
+                    f'keychain "Claude Code-credentials": not found (rc={result.returncode})'
+                )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            debug.append(f'keychain "Claude Code-credentials": error — {exc}')
+
+        # 1b. macOS Keychain — API key entry ("Claude Code")
+        #     Plain string, not JSON. Used when an API key is stored directly.
         try:
             result = subprocess.run(
                 ["security", "find-generic-password", "-s", "Claude Code", "-w"],
                 capture_output=True, text=True, timeout=5,
             )
             if result.returncode == 0 and result.stdout.strip():
-                data = json.loads(result.stdout.strip())
-                token = data.get("accessToken", "")
-                if token:
-                    return (token, "macOS Keychain")
-        except (json.JSONDecodeError, subprocess.TimeoutExpired, OSError):
-            pass
+                raw = result.stdout.strip()
+                debug.append(f'keychain "Claude Code": found ({len(raw)} chars)')
+                return (raw, "macOS Keychain (API key)", debug)
+            else:
+                debug.append(
+                    f'keychain "Claude Code": not found (rc={result.returncode})'
+                )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            debug.append(f'keychain "Claude Code": error — {exc}')
+    else:
+        debug.append(
+            f"keychain: skipped (platform={sys.platform}, "
+            f"security={'found' if shutil.which('security') else 'missing'})"
+        )
 
     # 2. CLAUDE_CODE_OAUTH_TOKEN env var
     token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
     if token:
-        return (token, "CLAUDE_CODE_OAUTH_TOKEN env var")
+        debug.append("CLAUDE_CODE_OAUTH_TOKEN env var: found")
+        return (token, "CLAUDE_CODE_OAUTH_TOKEN env var", debug)
+    debug.append("CLAUDE_CODE_OAUTH_TOKEN env var: not set")
 
     # 3. ~/.claude/.credentials.json file (Linux stores creds here)
     creds_file = Path("~/.claude/.credentials.json").expanduser()
@@ -241,16 +289,25 @@ def _resolve_claude_credential() -> tuple[str, str]:
             data = json.loads(creds_file.read_text(encoding="utf-8"))
             token = data.get("claudeAiOauth", {}).get("accessToken", "")
             if token:
-                return (token, "~/.claude/.credentials.json")
-        except (json.JSONDecodeError, OSError):
-            pass
+                debug.append("~/.claude/.credentials.json: found OAuth token")
+                return (token, "~/.claude/.credentials.json", debug)
+            debug.append(
+                f"~/.claude/.credentials.json: exists but no claudeAiOauth.accessToken "
+                f"(keys: {list(data.keys())})"
+            )
+        except (json.JSONDecodeError, OSError) as exc:
+            debug.append(f"~/.claude/.credentials.json: parse error — {exc}")
+    else:
+        debug.append(f"~/.claude/.credentials.json: file not found ({creds_file})")
 
     # 4. ANTHROPIC_API_KEY env var
     key = os.environ.get("ANTHROPIC_API_KEY", "")
     if key:
-        return (key, "ANTHROPIC_API_KEY env var")
+        debug.append("ANTHROPIC_API_KEY env var: found")
+        return (key, "ANTHROPIC_API_KEY env var", debug)
+    debug.append("ANTHROPIC_API_KEY env var: not set")
 
-    return ("", "none")
+    return ("", "none", debug)
 
 
 def _resolve_gh_token() -> tuple[str, str]:
@@ -408,11 +465,11 @@ class SetupWizard:
 
         # --- Claude credential ---
         click.secho("  Claude:", bold=True)
-        claude_token, claude_source = _resolve_claude_credential()
+        claude_token, claude_source, claude_debug = _resolve_claude_credential()
 
         if claude_token:
             # Distinguish OAuth tokens from API keys for storage
-            is_api_key = claude_source == "ANTHROPIC_API_KEY env var"
+            is_api_key = claude_source in ("ANTHROPIC_API_KEY env var", "macOS Keychain (API key)")
             if is_api_key:
                 click.secho(f"    ✓ Found API key (source: {claude_source})", fg="green")
                 self.choices.anthropic_api_key = claude_token
@@ -421,6 +478,10 @@ class SetupWizard:
                 self.choices.claude_oauth_token = claude_token
         else:
             click.secho("    ✗ No credentials found automatically.", fg="yellow")
+            click.echo()
+            click.secho("    Debug — tried each source in order:", dim=True)
+            for line in claude_debug:
+                click.secho(f"      · {line}", dim=True)
             click.echo()
             click.secho("    1) Anthropic API key (sk-ant-...)", dim=True)
             click.secho("    2) Paste OAuth token (run `claude setup-token`)", dim=True)

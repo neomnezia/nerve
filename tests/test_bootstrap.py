@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import stat
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -539,7 +540,7 @@ class TestCredentialWaterfall:
     def test_resolve_claude_from_oauth_env(self) -> None:
         """CLAUDE_CODE_OAUTH_TOKEN env var should be picked up."""
         with patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-test"}, clear=False):
-            token, source = _resolve_claude_credential()
+            token, source, debug = _resolve_claude_credential()
         assert token == "sk-ant-oat01-test"
         assert source == "CLAUDE_CODE_OAUTH_TOKEN env var"
 
@@ -550,7 +551,7 @@ class TestCredentialWaterfall:
         with patch.dict(os.environ, env, clear=False):
             # Remove CLAUDE_CODE_OAUTH_TOKEN if set
             os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
-            token, source = _resolve_claude_credential()
+            token, source, debug = _resolve_claude_credential()
         assert token == "sk-ant-api03-test"
         assert source == "ANTHROPIC_API_KEY env var"
 
@@ -564,7 +565,7 @@ class TestCredentialWaterfall:
              patch("nerve.bootstrap.sys.platform", "linux"):
             os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
             os.environ.pop("ANTHROPIC_API_KEY", None)
-            token, source = _resolve_claude_credential()
+            token, source, debug = _resolve_claude_credential()
         assert token == "sk-ant-oat01-file"
         assert "credentials.json" in source
 
@@ -572,9 +573,11 @@ class TestCredentialWaterfall:
         """Should return empty when no credentials found."""
         with patch.dict(os.environ, {}, clear=True), \
              patch("nerve.bootstrap.sys.platform", "linux"):
-            token, source = _resolve_claude_credential()
+            token, source, debug = _resolve_claude_credential()
         assert token == ""
         assert source == "none"
+        # Debug log should have entries for every source tried
+        assert len(debug) > 0
 
     def test_resolve_claude_oauth_takes_priority(self) -> None:
         """OAuth token should win over API key."""
@@ -583,9 +586,39 @@ class TestCredentialWaterfall:
             "ANTHROPIC_API_KEY": "api-key",
         }
         with patch.dict(os.environ, env, clear=False):
-            token, source = _resolve_claude_credential()
+            token, source, debug = _resolve_claude_credential()
         assert token == "oauth-token"
         assert "CLAUDE_CODE_OAUTH_TOKEN" in source
+
+    def test_resolve_claude_keychain_oauth(self) -> None:
+        """macOS Keychain 'Claude Code-credentials' should return OAuth token."""
+        keychain_json = '{"claudeAiOauth": {"accessToken": "keychain-oauth-tok"}}'
+        mock_result = subprocess.CompletedProcess(args=[], returncode=0, stdout=keychain_json, stderr="")
+
+        with patch("nerve.bootstrap.sys.platform", "darwin"), \
+             patch("nerve.bootstrap.shutil.which", return_value="/usr/bin/security"), \
+             patch("nerve.bootstrap.subprocess.run", return_value=mock_result):
+            token, source, debug = _resolve_claude_credential()
+        assert token == "keychain-oauth-tok"
+        assert "OAuth" in source
+
+    def test_resolve_claude_keychain_api_key(self) -> None:
+        """macOS Keychain 'Claude Code' should return raw API key when OAuth entry missing."""
+        # First call (Claude Code-credentials) fails, second (Claude Code) succeeds
+        fail = subprocess.CompletedProcess(args=[], returncode=44, stdout="", stderr="")
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="sk-ant-raw-key\n", stderr="")
+
+        def side_effect(cmd, **kw):
+            if "Claude Code-credentials" in cmd:
+                return fail
+            return ok
+
+        with patch("nerve.bootstrap.sys.platform", "darwin"), \
+             patch("nerve.bootstrap.shutil.which", return_value="/usr/bin/security"), \
+             patch("nerve.bootstrap.subprocess.run", side_effect=side_effect):
+            token, source, debug = _resolve_claude_credential()
+        assert token == "sk-ant-raw-key"
+        assert "API key" in source
 
     def test_resolve_gh_from_env(self) -> None:
         """GH_TOKEN env var should be picked up."""
