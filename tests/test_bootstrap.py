@@ -544,11 +544,13 @@ class TestCredentialWaterfall:
         assert token == "sk-ant-oat01-test"
         assert source == "CLAUDE_CODE_OAUTH_TOKEN env var"
 
-    def test_resolve_claude_from_api_key_env(self) -> None:
+    def test_resolve_claude_from_api_key_env(self, tmp_path: Path) -> None:
         """ANTHROPIC_API_KEY should be last resort in waterfall."""
         env = {"ANTHROPIC_API_KEY": "sk-ant-api03-test"}
-        # Clear OAuth token to ensure it doesn't interfere
-        with patch.dict(os.environ, env, clear=False):
+        # Point credentials file at a non-existent path so the real one isn't found
+        fake_creds = tmp_path / "nonexistent" / ".credentials.json"
+        with patch.dict(os.environ, env, clear=False), \
+             patch("nerve.bootstrap.Path.expanduser", return_value=fake_creds):
             # Remove CLAUDE_CODE_OAUTH_TOKEN if set
             os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
             token, source, debug = _resolve_claude_credential()
@@ -569,10 +571,13 @@ class TestCredentialWaterfall:
         assert token == "sk-ant-oat01-file"
         assert "credentials.json" in source
 
-    def test_resolve_claude_none(self) -> None:
+    def test_resolve_claude_none(self, tmp_path: Path) -> None:
         """Should return empty when no credentials found."""
+        # Point credentials file at a non-existent path so the real one isn't found
+        fake_creds = tmp_path / "nonexistent" / ".credentials.json"
         with patch.dict(os.environ, {}, clear=True), \
-             patch("nerve.bootstrap.sys.platform", "linux"):
+             patch("nerve.bootstrap.sys.platform", "linux"), \
+             patch("nerve.bootstrap.Path.expanduser", return_value=fake_creds):
             token, source, debug = _resolve_claude_credential()
         assert token == ""
         assert source == "none"
