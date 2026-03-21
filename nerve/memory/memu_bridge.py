@@ -1550,6 +1550,9 @@ class MemUBridge:
             return self._anthropic_client
         import anthropic
         base_url = self.config.anthropic_api_base_url.rstrip("/")
+        # Strip /v1/ suffix — Anthropic SDK prepends it internally.
+        if base_url.endswith("/v1"):
+            base_url = base_url[:-3]
         self._anthropic_client = anthropic.Anthropic(
             api_key=self.config.effective_api_key,
             base_url=base_url,

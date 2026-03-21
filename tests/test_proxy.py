@@ -534,3 +534,68 @@ class TestSubsystemConfigWiring:
         assert len(runners) >= 1
         assert runners[0].condense_config["api_key"] == "sk-ant-real-key"
         assert "api.anthropic.com" in runners[0].condense_config["base_url"]
+
+
+class TestCondenseClientBaseUrl:
+    """Verify condense client strips /v1 suffix to avoid /v1/v1/messages."""
+
+    @pytest.mark.asyncio
+    async def test_condense_client_strips_v1_from_proxy_url(self) -> None:
+        """Proxy base_url includes /v1/ — SDK must not double it."""
+        from nerve.sources.runner import SourceRunner
+
+        runner = SourceRunner(
+            source=MagicMock(),
+            db=MagicMock(),
+            condense=True,
+            condense_config={
+                "api_key": "sk-test",
+                "model": "claude-haiku-4-5-20251001",
+                "base_url": "http://127.0.0.1:8317/v1/",
+            },
+        )
+        client = await runner._get_condense_client()
+        assert client is not None
+        base = str(client.base_url)
+        # Must NOT contain /v1/v1
+        assert "/v1/v1" not in base
+        # Must end with the proxy host (no /v1 path)
+        assert base.rstrip("/") == "http://127.0.0.1:8317"
+
+    @pytest.mark.asyncio
+    async def test_condense_client_strips_v1_from_direct_url(self) -> None:
+        """Direct API base_url also includes /v1/ — same fix applies."""
+        from nerve.sources.runner import SourceRunner
+
+        runner = SourceRunner(
+            source=MagicMock(),
+            db=MagicMock(),
+            condense=True,
+            condense_config={
+                "api_key": "sk-test",
+                "model": "claude-haiku-4-5-20251001",
+                "base_url": "https://api.anthropic.com/v1/",
+            },
+        )
+        client = await runner._get_condense_client()
+        assert client is not None
+        base = str(client.base_url)
+        assert "/v1/v1" not in base
+        assert base.rstrip("/") == "https://api.anthropic.com"
+
+    @pytest.mark.asyncio
+    async def test_condense_client_no_base_url(self) -> None:
+        """Without base_url, SDK uses its default — no crash."""
+        from nerve.sources.runner import SourceRunner
+
+        runner = SourceRunner(
+            source=MagicMock(),
+            db=MagicMock(),
+            condense=True,
+            condense_config={
+                "api_key": "sk-test",
+                "model": "claude-haiku-4-5-20251001",
+            },
+        )
+        client = await runner._get_condense_client()
+        assert client is not None

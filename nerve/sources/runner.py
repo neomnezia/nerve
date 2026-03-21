@@ -173,7 +173,12 @@ class SourceRunner:
     # ------------------------------------------------------------------
 
     async def _get_condense_client(self) -> Any | None:
-        """Get or create the shared AsyncAnthropic client for condensation."""
+        """Get or create the shared AsyncAnthropic client for condensation.
+
+        Returns None when proxy mode is active (uses httpx directly).
+        """
+        if self.condense_config.get("use_proxy"):
+            return None  # Proxy uses OpenAI-compatible httpx calls
         if self._condense_client is not None:
             return self._condense_client
         api_key = self.condense_config.get("api_key")
@@ -187,9 +192,43 @@ class SourceRunner:
         base_url = self.condense_config.get("base_url")
         kwargs: dict[str, Any] = {"api_key": api_key}
         if base_url:
-            kwargs["base_url"] = base_url.rstrip("/")
+            # Strip /v1/ suffix — Anthropic SDK prepends it internally,
+            # so including it here causes /v1/v1/messages (404).
+            url = base_url.rstrip("/")
+            if url.endswith("/v1"):
+                url = url[:-3]
+            kwargs["base_url"] = url
         self._condense_client = anthropic.AsyncAnthropic(**kwargs)
         return self._condense_client
+
+    async def _condense_via_proxy(
+        self, content: str, model: str,
+    ) -> str:
+        """Condense content via the OpenAI-compatible proxy endpoint."""
+        import httpx
+
+        base_url = self.condense_config.get("base_url", "")
+        if not base_url.endswith("/"):
+            base_url += "/"
+        api_key = self.condense_config.get("api_key", "")
+
+        async with httpx.AsyncClient() as http_client:
+            resp = await http_client.post(
+                f"{base_url}chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "max_tokens": 1024,
+                    "messages": [{"role": "user", "content": content}],
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
 
     async def _condense_long_content(
         self, records: list[SourceRecord],
@@ -211,13 +250,21 @@ class SourceRunner:
         if not long_records:
             return records
 
-        client = await self._get_condense_client()
-        if not client:
-            return records
+        use_proxy = self.condense_config.get("use_proxy", False)
+
+        if not use_proxy:
+            client = await self._get_condense_client()
+            if not client:
+                return records
+        else:
+            client = None
+            if not self.condense_config.get("api_key"):
+                return records
 
         logger.info(
-            "Source %s: condensing %d/%d records with %s",
+            "Source %s: condensing %d/%d records with %s%s",
             self.source.source_name, len(long_records), len(records), model,
+            " (via proxy)" if use_proxy else "",
         )
         sem = asyncio.Semaphore(5)
 
@@ -225,22 +272,28 @@ class SourceRunner:
             async with sem:
                 original_len = len(record.content)
                 try:
-                    response = await asyncio.wait_for(
-                        client.messages.create(
-                            model=model,
-                            max_tokens=1024,
-                            messages=[{
-                                "role": "user",
-                                "content": (
-                                    f"{_CONDENSE_PROMPT}\n\n"
-                                    f"---\n\n"
-                                    f"{record.content}"
-                                ),
-                            }],
-                        ),
-                        timeout=30,
+                    prompt_content = (
+                        f"{_CONDENSE_PROMPT}\n\n"
+                        f"---\n\n"
+                        f"{record.content}"
                     )
-                    condensed = response.content[0].text
+                    if use_proxy:
+                        condensed = await self._condense_via_proxy(
+                            prompt_content, model,
+                        )
+                    else:
+                        response = await asyncio.wait_for(
+                            client.messages.create(
+                                model=model,
+                                max_tokens=1024,
+                                messages=[{
+                                    "role": "user",
+                                    "content": prompt_content,
+                                }],
+                            ),
+                            timeout=30,
+                        )
+                        condensed = response.content[0].text
                     record.content = condensed
                     logger.debug(
                         "Condensed %s: %d → %d chars",
