@@ -48,7 +48,7 @@ class StreamAdapter:
         self._last_tool_name: str | None = None
         self._tool_run_count: int = 0
         self._tool_label_start: int = 0
-        self._tool_label_prefix: str = "\n"
+        self._tool_label_prefix: str = "\n\n"
 
         # Precompute capability checks
         self._supports_streaming = (
@@ -87,7 +87,7 @@ class StreamAdapter:
                     self._last_tool_name = tool_name
                     self._tool_run_count = 1
                     self._tool_label_start = len(self._buffer)
-                    self._tool_label_prefix = "" if after_tool else "\n"
+                    self._tool_label_prefix = "" if after_tool else "\n\n"
                     self._buffer += f"{self._tool_label_prefix}`[{tool_name}]`\n"
 
         elif msg_type == "done":
