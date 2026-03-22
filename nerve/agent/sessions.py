@@ -60,6 +60,9 @@ class SessionManager:
         # Running task tracking
         self._running_tasks: dict[str, asyncio.Task] = {}
         self._running_sessions: set[str] = set()
+        # Stop-requested flag: set when /stop arrives before the SDK client
+        # is registered.  _run_inner() checks this after creating the client.
+        self._stop_requested: set[str] = set()
         # Serialize status transitions
         self._transition_lock = asyncio.Lock()
         # Callback for memorizing session before close/archive/delete.
@@ -323,33 +326,69 @@ class SessionManager:
         """Return the set of currently running session IDs."""
         return set(self._running_sessions)
 
-    async def stop_session(self, session_id: str) -> bool:
-        """Stop a running session.
+    def request_stop(self, session_id: str) -> None:
+        """Set a deferred stop flag (checked by _run_inner after client init)."""
+        self._stop_requested.add(session_id)
 
-        Uses SDK client.interrupt() first for clean stop, falls back to
-        asyncio task cancellation.  Returns True if something was stopped.
+    def pop_stop_request(self, session_id: str) -> bool:
+        """Return True and clear if a stop was requested for *session_id*."""
+        try:
+            self._stop_requested.remove(session_id)
+            return True
+        except KeyError:
+            return False
+
+    async def stop_session(self, session_id: str) -> bool:
+        """Stop the current turn of a running session.
+
+        Sends SDK interrupt first — this gracefully ends the current turn
+        while keeping the client alive for the next message.  Falls back
+        to asyncio task cancellation (which disconnects the client) only
+        if the interrupt doesn't complete within a timeout.
         """
-        # Try SDK interrupt first (cleanly stops the current turn)
         client = self._clients.get(session_id)
+        interrupted = False
         if client:
             try:
                 await client.interrupt()
+                interrupted = True
                 logger.info("Interrupted SDK client for session %s", session_id)
-                return True
             except Exception as e:
                 logger.warning(
-                    "SDK interrupt failed for %s: %s, falling back to cancel",
+                    "SDK interrupt failed for %s: %s",
                     session_id, e,
                 )
 
-        # Fallback: cancel the asyncio task
         task = self._running_tasks.get(session_id)
         if task and not task.done():
+            if interrupted:
+                # Give interrupt time to complete the turn gracefully.
+                # When it works, receive_response() yields a ResultMessage,
+                # _run_inner exits via the normal path, and the client
+                # stays alive for the next message.
+                done, _ = await asyncio.wait({task}, timeout=5.0)
+                if done:
+                    logger.info(
+                        "Session %s stopped gracefully via interrupt",
+                        session_id,
+                    )
+                    return True
+
+            # Interrupt failed or timed out — force cancel.
+            # The CancelledError handler in _run_inner disconnects the
+            # client since its state is inconsistent.
             task.cancel()
-            logger.info("Cancelled task for session %s", session_id)
+            logger.info("Cancelled task for session %s (interrupt timed out)", session_id)
             return True
 
-        return False
+        # Session is running but client/task not registered yet — set a
+        # deferred stop flag that _run_inner() will check after client init.
+        if self.is_running(session_id):
+            self.request_stop(session_id)
+            logger.info("Deferred stop requested for session %s", session_id)
+            return True
+
+        return client is not None  # interrupt was sent even if no task
 
     # ------------------------------------------------------------------ #
     #  Fork & resume                                                       #

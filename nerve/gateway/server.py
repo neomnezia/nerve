@@ -91,13 +91,13 @@ async def lifespan(app: FastAPI):
     set_notification_service(notification_service)
 
     # Start Telegram bot if enabled
-    telegram_task = None
+    telegram_channel = None
     if config.telegram.enabled and config.telegram.bot_token:
         from nerve.channels.telegram import TelegramChannel
-        telegram = TelegramChannel(config, _engine.router)
-        telegram.set_notification_service(notification_service)
-        _engine.register_channel(telegram)
-        telegram_task = asyncio.create_task(telegram.start())
+        telegram_channel = TelegramChannel(config, _engine.router)
+        telegram_channel.set_notification_service(notification_service)
+        _engine.register_channel(telegram_channel)
+        await telegram_channel.start()
         logger.info("Telegram bot started")
 
     # Start cron service
@@ -187,16 +187,19 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # Shutdown: stop telegram FIRST, before cancelling background tasks.
+    # Background task cancellation propagates through anyio cancel scopes
+    # (Starlette runs the lifespan in an anyio context), which can kill
+    # the telegram polling task before we get a chance to stop it cleanly.
+    if telegram_channel:
+        await telegram_channel.stop()
+    if cron_task:
+        await cron_task.stop()
+
     notify_expiry_task.cancel()
     idle_sweep_task.cancel()
     memorize_task.cancel()
     cleanup_task.cancel()
-
-    # Shutdown
-    if cron_task:
-        await cron_task.stop()
-    if telegram_task:
-        telegram_task.cancel()
     await _engine.shutdown()
     await close_db()
     if proxy_service:

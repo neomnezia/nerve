@@ -330,7 +330,13 @@ def stop(ctx: click.Context) -> None:
 @main.command()
 @click.pass_context
 def restart(ctx: click.Context) -> None:
-    """Restart the Nerve daemon."""
+    """Restart the Nerve daemon.
+
+    Spawns a detached helper process that stops the old daemon and starts a
+    new one.  This ensures restarts work even when triggered from *inside*
+    the running daemon (e.g. via the Telegram bot / agent), because the
+    helper runs in its own session and survives the parent's death.
+    """
     config = ctx.obj["config"]
     config_dir = Path(ctx.obj["config_dir"])
 
@@ -342,32 +348,76 @@ def restart(ctx: click.Context) -> None:
         ctx.exit(rc)
         return
 
-    running, pid = _get_daemon_status()
+    # Build the command that `start` would use to launch the daemon.
+    verbose = ctx.obj["verbose"]
+    nerve_bin = sys.argv[0]
+    start_cmd_parts = [sys.executable, nerve_bin, "-c", str(config_dir)]
+    if verbose:
+        start_cmd_parts.append("-v")
+    start_cmd_parts.extend(["start", "--foreground"])
+
+    running, old_pid = _get_daemon_status()
+
+    # Spawn a detached helper that: waits for old PID to exit, then starts
+    # a new daemon.  Written as an inline Python script so we don't need an
+    # external shell script on disk.
+    helper_script = (
+        "import os, signal, subprocess, sys, time\n"
+        f"old_pid = {old_pid if running else 'None'}\n"
+        f"pid_file = {str(PID_FILE)!r}\n"
+        f"log_file = {str(LOG_FILE)!r}\n"
+        f"start_cmd = {start_cmd_parts!r}\n"
+        "if old_pid is not None:\n"
+        "    try:\n"
+        "        os.kill(old_pid, signal.SIGTERM)\n"
+        "    except ProcessLookupError:\n"
+        "        pass\n"
+        "    for _ in range(30):\n"
+        "        time.sleep(0.5)\n"
+        "        try:\n"
+        "            os.kill(old_pid, 0)\n"
+        "        except ProcessLookupError:\n"
+        "            break\n"
+        "    else:\n"
+        "        try:\n"
+        "            os.kill(old_pid, signal.SIGKILL)\n"
+        "            time.sleep(0.5)\n"
+        "        except ProcessLookupError:\n"
+        "            pass\n"
+        "    # Remove stale PID file\n"
+        "    try:\n"
+        "        os.unlink(pid_file)\n"
+        "    except FileNotFoundError:\n"
+        "        pass\n"
+        "time.sleep(0.5)\n"
+        "log_fd = open(log_file, 'a')\n"
+        "proc = subprocess.Popen(\n"
+        "    start_cmd,\n"
+        "    stdout=log_fd,\n"
+        "    stderr=log_fd,\n"
+        "    stdin=subprocess.DEVNULL,\n"
+        "    start_new_session=True,\n"
+        ")\n"
+        "log_fd.close()\n"
+        "time.sleep(1)\n"
+        "if proc.poll() is not None:\n"
+        "    sys.exit(1)\n"
+    )
+
+    log_fd = open(LOG_FILE, "a")
+    subprocess.Popen(
+        [sys.executable, "-c", helper_script],
+        stdout=log_fd,
+        stderr=log_fd,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    log_fd.close()
+
     if running:
-        click.echo(f"Stopping Nerve (PID {pid})...")
-        os.kill(pid, signal.SIGTERM)
-
-        # Wait for shutdown
-        for _ in range(30):
-            time.sleep(0.5)
-            if not _is_running(pid):
-                break
-        else:
-            click.echo("Graceful shutdown timed out, sending SIGKILL...")
-            try:
-                os.kill(pid, signal.SIGKILL)
-                time.sleep(0.5)
-            except ProcessLookupError:
-                pass
-
-        _remove_pid()
-        click.echo("Nerve stopped")
-
-    # Brief pause before restart
-    time.sleep(0.5)
-
-    # Start again — invoke start command
-    ctx.invoke(start)
+        click.echo(f"Restarting Nerve (PID {old_pid})... new instance will start shortly.")
+    else:
+        click.echo("Starting Nerve... new instance will start shortly.")
 
 
 @main.command()

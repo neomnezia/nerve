@@ -7,12 +7,19 @@ Session management is delegated to ChannelRouter.
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import collections
+import html as _html
 import logging
+import re
+import socket
+import time
 from typing import Any, TYPE_CHECKING
 
 from telegram import Update
 from telegram.constants import ChatAction, ParseMode
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, MessageReactionHandler, filters
 
 from nerve.channels.base import (
     BaseChannel,
@@ -32,6 +39,112 @@ logger = logging.getLogger(__name__)
 MAX_MSG_LEN = 4096
 # Minimum interval between message edits (seconds) to avoid rate limits
 EDIT_INTERVAL = 1.5
+# Watchdog: check every 30s, log heartbeat every ~5 min
+WATCHDOG_INTERVAL = 30
+WATCHDOG_HEARTBEAT_EVERY = 10
+
+# TCP keepalive: prevent NAT/firewall from silently dropping the
+# long-poll connection.  These values tell the OS to send a keepalive
+# probe after 60s idle, retry every 10s, give up after 3 failures.
+_TCP_KEEPALIVE_OPTS = (
+    (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+    (socket.SOL_TCP, socket.TCP_KEEPIDLE, 60),
+    (socket.SOL_TCP, socket.TCP_KEEPINTVL, 10),
+    (socket.SOL_TCP, socket.TCP_KEEPCNT, 3),
+)
+
+
+def _md_to_tg_html(text: str) -> str:
+    """Convert standard Markdown to Telegram-compatible HTML.
+
+    Telegram's legacy ``ParseMode.MARKDOWN`` only supports ``*bold*``,
+    but LLMs emit ``**bold**`` (standard Markdown).  This converts the
+    common constructs to HTML so we can use ``ParseMode.HTML`` instead,
+    which is more predictable and doesn't choke on special characters.
+
+    Handles: ``**bold**``, ``*italic*``, `` `code` ``, code fences,
+    and ``[text](url)``.  Unmatched markers pass through as-is.
+    """
+    protected: list[str] = []
+
+    def _protect(replacement: str) -> str:
+        idx = len(protected)
+        protected.append(replacement)
+        return f"\x00{idx}\x00"
+
+    # -- protect constructs that contain chars we'd otherwise escape --
+
+    # Code fences: ```lang\n...\n```
+    def _fence(m: re.Match) -> str:
+        return _protect(f"<pre>{_html.escape(m.group(2))}</pre>")
+    text = re.sub(r"```(\w*)\n?(.*?)```", _fence, text, flags=re.DOTALL)
+
+    # Inline code: `...`
+    def _code(m: re.Match) -> str:
+        return _protect(f"<code>{_html.escape(m.group(1))}</code>")
+    text = re.sub(r"`([^`]+)`", _code, text)
+
+    # Markdown links: [text](url)
+    def _link(m: re.Match) -> str:
+        label = _html.escape(m.group(1))
+        url = m.group(2)
+        return _protect(f'<a href="{url}">{label}</a>')
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _link, text)
+
+    # -- escape remaining HTML entities --
+    text = _html.escape(text, quote=False)
+
+    # -- inline formatting --
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", text)
+
+    # -- restore protected spans --
+    for i, repl in enumerate(protected):
+        text = text.replace(f"\x00{i}\x00", repl)
+
+    return text
+
+
+def _format_reply_context(message: Any) -> str:
+    """Extract reply-to context and quote from a Telegram message.
+
+    Returns a prefix string like:
+        [Reply to assistant: "original text here"]
+        [Quoted: "selected portion"]
+
+    Returns empty string if the message is not a reply.
+    """
+    reply = getattr(message, "reply_to_message", None)
+    if not reply:
+        return ""
+
+    parts: list[str] = []
+
+    # Determine sender label
+    from_user = getattr(reply, "from_user", None)
+    if from_user and getattr(from_user, "is_bot", False):
+        sender = "assistant"
+    elif from_user:
+        sender = getattr(from_user, "first_name", None) or "user"
+    else:
+        sender = "user"
+
+    # Original message text
+    original = getattr(reply, "text", None) or getattr(reply, "caption", None) or ""
+    if original:
+        display = original if len(original) <= 500 else original[:500] + "…"
+        parts.append(f'[Reply to {sender}: "{display}"]')
+    else:
+        parts.append(f"[Reply to {sender}'s message]")
+
+    # Quote (manually selected text)
+    quote = getattr(message, "quote", None)
+    if quote:
+        quote_text = getattr(quote, "text", None)
+        if quote_text:
+            parts.append(f'[Quoted: "{quote_text}"]')
+
+    return "\n".join(parts)
 
 
 class TelegramChannel(BaseChannel):
@@ -47,6 +160,17 @@ class TelegramChannel(BaseChannel):
         self._app: Application | None = None
         self._allowed_users: set[int] = set(config.telegram.allowed_users)
         self._notification_service = None  # Set after service is created
+        self._watchdog_task: asyncio.Task | None = None
+        self._stopping = False
+        self._last_update_time: float = 0.0  # monotonic, set on any incoming update
+        # Media group (album) collection: group_id -> list of updates
+        self._media_groups: dict[str, list[Update]] = {}
+        self._media_group_tasks: dict[str, asyncio.Task] = {}
+        # Message cache for reaction context: message_id -> (chat_id, text_snippet)
+        self._message_cache: collections.OrderedDict[int, tuple[int, str]] = (
+            collections.OrderedDict()
+        )
+        self._message_cache_max = 200
 
     def set_notification_service(self, service) -> None:
         """Wire the notification service for callback query handling."""
@@ -62,6 +186,7 @@ class TelegramChannel(BaseChannel):
             ChannelCapability.SEND_TEXT
             | ChannelCapability.MARKDOWN
             | ChannelCapability.TYPING_INDICATOR
+            | ChannelCapability.REACTIONS
         )
         if self.config.telegram.stream_mode == "partial":
             caps |= ChannelCapability.STREAMING
@@ -79,37 +204,229 @@ class TelegramChannel(BaseChannel):
     #  Lifecycle                                                           #
     # ------------------------------------------------------------------ #
 
+    def _build_application(self) -> Application:
+        """Build a PTB Application with robust connection settings."""
+        builder = (
+            Application.builder()
+            .token(self.config.telegram.bot_token)
+            # Process updates concurrently so /stop can interrupt a running
+            # message handler instead of being queued behind it.
+            .concurrent_updates(True)
+            # TCP keepalive on the polling connection — prevents NAT/firewall
+            # from silently dropping the long-poll connection
+            .get_updates_socket_options(_TCP_KEEPALIVE_OPTS)
+            # Separate connection pool for polling vs sending, so a stuck
+            # outbound request can't starve the polling connection
+            .get_updates_connection_pool_size(1)
+            .get_updates_read_timeout(10)
+            .get_updates_connect_timeout(10)
+            .get_updates_pool_timeout(1.0)
+        )
+        app = builder.build()
+
+        # Register handlers
+        app.add_handler(CommandHandler("start", self._handle_start))
+        app.add_handler(CommandHandler("session", self._handle_session))
+        app.add_handler(CommandHandler("sessions", self._handle_sessions))
+        app.add_handler(CommandHandler("new", self._handle_new_session))
+        app.add_handler(CommandHandler("stop", self._handle_stop))
+        app.add_handler(CommandHandler("reply", self._handle_reply))
+        app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+        app.add_handler(MessageHandler(
+            (filters.TEXT | filters.PHOTO) & ~filters.COMMAND,
+            self._handle_message,
+        ))
+        app.add_handler(MessageReactionHandler(self._handle_reaction))
+        app.add_error_handler(self._handle_error)
+
+        return app
+
     async def start(self) -> None:
         """Start the Telegram bot."""
         if not self.config.telegram.bot_token:
             logger.warning("Telegram bot token not configured")
             return
 
-        self._app = (
-            Application.builder()
-            .token(self.config.telegram.bot_token)
-            .build()
-        )
-
-        # Register handlers
-        self._app.add_handler(CommandHandler("start", self._handle_start))
-        self._app.add_handler(CommandHandler("session", self._handle_session))
-        self._app.add_handler(CommandHandler("sessions", self._handle_sessions))
-        self._app.add_handler(CommandHandler("new", self._handle_new_session))
-        self._app.add_handler(CommandHandler("reply", self._handle_reply))
-        self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
-        self._app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_message))
+        self._stopping = False
+        self._app = self._build_application()
 
         await self._app.initialize()
         await self._app.start()
-        await self._app.updater.start_polling(drop_pending_updates=True)
-        logger.info("Telegram bot started polling")
+        await self._app.updater.start_polling(
+            drop_pending_updates=True,
+            # Retry initial connection indefinitely — don't give up on
+            # transient network errors during startup
+            bootstrap_retries=-1,
+            # Explicitly request all update types — the default set excludes
+            # message_reaction, and auto-detection only works via
+            # Application.run_polling(), not Updater.start_polling().
+            allowed_updates=Update.ALL_TYPES,
+        )
+        self._last_update_time = time.monotonic()
+        logger.info("Telegram bot started polling (with TCP keepalive)")
+
+        # Launch watchdog for monitoring + recovery
+        self._watchdog_task = asyncio.create_task(
+            self._run_watchdog(), name="telegram-polling-watchdog",
+        )
 
     async def stop(self) -> None:
+        self._stopping = True
+        if self._watchdog_task and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except asyncio.CancelledError:
+                pass
         if self._app:
             await self._app.updater.stop()
             await self._app.stop()
             await self._app.shutdown()
+
+    # ------------------------------------------------------------------ #
+    #  Watchdog — monitor both Updater and Application health              #
+    # ------------------------------------------------------------------ #
+
+    async def _run_watchdog(self) -> None:
+        """Monitor Telegram bot health and log diagnostics.
+
+        Checks BOTH the Updater (fetches updates from Telegram) AND the
+        Application (processes updates from queue → handlers).  Previous
+        versions only checked the Updater, missing cases where the
+        Application's update-processing task crashed silently.
+        """
+        check_count = 0
+        while not self._stopping:
+            try:
+                await asyncio.sleep(WATCHDOG_INTERVAL)
+            except asyncio.CancelledError:
+                break
+
+            if self._app is None or self._stopping:
+                break
+
+            check_count += 1
+            status = self._get_health_status()
+
+            # Periodic heartbeat
+            if check_count % WATCHDOG_HEARTBEAT_EVERY == 0:
+                logger.info(
+                    "Telegram watchdog: %s (check #%d, last_update=%s, queue=%d)",
+                    status["summary"], check_count,
+                    status["last_update_ago"], status["queue_size"],
+                )
+
+            if not status["healthy"]:
+                logger.warning(
+                    "Telegram bot unhealthy: %s (queue=%d, last_update=%s) — rebuilding",
+                    status["summary"], status["queue_size"],
+                    status["last_update_ago"],
+                )
+                try:
+                    await self._rebuild()
+                    logger.info("Telegram bot rebuilt successfully")
+                except Exception as e:
+                    logger.error("Telegram bot rebuild failed: %s", e, exc_info=True)
+
+    def _get_health_status(self) -> dict:
+        """Check health of both Updater and Application."""
+        now = time.monotonic()
+        stale_sec = now - self._last_update_time if self._last_update_time > 0 else 0
+        last_ago = f"{stale_sec:.0f}s ago" if self._last_update_time > 0 else "never"
+
+        result = {
+            "healthy": True,
+            "summary": "ok",
+            "last_update_ago": last_ago,
+            "queue_size": 0,
+        }
+
+        if not self._app:
+            result.update(healthy=False, summary="no Application")
+            return result
+
+        # --- Check update queue ---
+        # If updates pile up in the queue, the Application isn't consuming them
+        try:
+            result["queue_size"] = self._app.update_queue.qsize()
+        except Exception:
+            pass
+
+        # --- Check Updater (the part that fetches from Telegram) ---
+        updater = self._app.updater
+        if not updater or not updater.running:
+            result.update(healthy=False, summary="updater not running")
+            return result
+
+        polling_task: asyncio.Task | None = getattr(
+            updater, "_Updater__polling_task", None,
+        )
+        if polling_task is not None and polling_task.done():
+            exc = None
+            try:
+                exc = polling_task.exception()
+            except (asyncio.CancelledError, asyncio.InvalidStateError):
+                pass
+            result.update(
+                healthy=False,
+                summary=f"polling task dead (exception: {exc})",
+            )
+            return result
+
+        # --- Check Application (the part that processes updates → handlers) ---
+        fetcher_task: asyncio.Task | None = getattr(
+            self._app, "_Application__update_fetcher_task", None,
+        )
+        if fetcher_task is not None and fetcher_task.done():
+            exc = None
+            try:
+                exc = fetcher_task.exception()
+            except (asyncio.CancelledError, asyncio.InvalidStateError):
+                pass
+            result.update(
+                healthy=False,
+                summary=f"update fetcher task dead (exception: {exc})",
+            )
+            return result
+
+        # --- Check for backed-up queue (Application alive but not consuming) ---
+        if result["queue_size"] > 10:
+            result.update(
+                healthy=False,
+                summary=f"update queue backed up ({result['queue_size']} pending)",
+            )
+            return result
+
+        return result
+
+    async def _rebuild(self) -> None:
+        """Tear down and rebuild the entire PTB Application."""
+        old_app = self._app
+        self._app = self._build_application()
+
+        await self._app.initialize()
+        await self._app.start()
+        await self._app.updater.start_polling(
+            drop_pending_updates=False,
+            bootstrap_retries=-1,
+            allowed_updates=Update.ALL_TYPES,
+        )
+        self._last_update_time = time.monotonic()
+
+        # Best-effort cleanup of the old app
+        if old_app:
+            try:
+                await asyncio.wait_for(old_app.updater.stop(), timeout=5)
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(old_app.stop(), timeout=5)
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(old_app.shutdown(), timeout=5)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ #
     #  Outbound: send complete message                                     #
@@ -124,11 +441,19 @@ class TelegramChannel(BaseChannel):
         # Split long messages
         for i in range(0, len(text), MAX_MSG_LEN):
             chunk = text[i:i + MAX_MSG_LEN]
-            await self._app.bot.send_message(
-                chat_id=chat_id,
-                text=chunk,
-                parse_mode=ParseMode.MARKDOWN,
-            )
+            html_chunk = _md_to_tg_html(chunk)
+            try:
+                sent = await self._app.bot.send_message(
+                    chat_id=chat_id,
+                    text=html_chunk,
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                sent = await self._app.bot.send_message(
+                    chat_id=chat_id,
+                    text=chunk,
+                )
+            self._cache_message(sent.message_id, chat_id, chunk)
 
     def format_response(self, text: str) -> str:
         """Truncate for Telegram if needed."""
@@ -153,11 +478,30 @@ class TelegramChannel(BaseChannel):
         if self._app is None:
             return
         chat_id = int(target)
-        await self._app.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=int(message_id),
-            text=text,
-        )
+        html_text = _md_to_tg_html(text)
+        try:
+            await self._app.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=int(message_id),
+                text=html_text,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:
+            exc_str = str(exc)
+            if "message is not modified" in exc_str.lower():
+                return  # Already up-to-date — don't clobber with plain text
+            logger.warning("edit_message HTML failed: %s", exc)
+            # Fallback: send without formatting if HTML parsing fails
+            try:
+                await self._app.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=int(message_id),
+                    text=text,
+                )
+            except Exception:
+                pass
+        # Update cache with the latest text (streaming overwrites placeholder)
+        self._cache_message(int(message_id), int(target), text)
 
     async def send_typing(self, target: str) -> None:
         """Show typing indicator."""
@@ -167,6 +511,35 @@ class TelegramChannel(BaseChannel):
             chat_id=int(target),
             action=ChatAction.TYPING,
         )
+
+    # ------------------------------------------------------------------ #
+    #  Reactions: set emoji on a message                                    #
+    # ------------------------------------------------------------------ #
+
+    async def set_reaction(self, target: str, message_id: int, emoji: str) -> None:
+        """Set an emoji reaction on a Telegram message."""
+        if self._app is None:
+            return
+        await self._app.bot.set_message_reaction(
+            chat_id=int(target),
+            message_id=message_id,
+            reaction=[emoji],
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Message cache (for reaction context)                                #
+    # ------------------------------------------------------------------ #
+
+    def _cache_message(self, message_id: int, chat_id: int, text: str) -> None:
+        """Store a message snippet in the LRU cache for reaction lookups."""
+        snippet = text[:200] if text else ""
+        if not snippet:
+            return
+        self._message_cache[message_id] = (chat_id, snippet)
+        # Move to end (most recent) and evict oldest if over limit
+        self._message_cache.move_to_end(message_id)
+        while len(self._message_cache) > self._message_cache_max:
+            self._message_cache.popitem(last=False)
 
     # ------------------------------------------------------------------ #
     #  Auth                                                                #
@@ -184,8 +557,13 @@ class TelegramChannel(BaseChannel):
     #  Command handlers — delegate to router for session management        #
     # ------------------------------------------------------------------ #
 
+    def _touch(self) -> None:
+        """Record that we received an update from Telegram."""
+        self._last_update_time = time.monotonic()
+
     async def _handle_start(self, update: Update, context: Any) -> None:
         """Handle /start command."""
+        self._touch()
         user_id = update.effective_user.id
         if not self._is_authorized(user_id):
             logger.warning("Unauthorized /start from user %d", user_id)
@@ -197,6 +575,7 @@ class TelegramChannel(BaseChannel):
 
     async def _handle_session(self, update: Update, context: Any) -> None:
         """Handle /session <id> — switch active session."""
+        self._touch()
         if not self._is_authorized(update.effective_user.id):
             return
         chat_id = update.effective_chat.id
@@ -222,6 +601,7 @@ class TelegramChannel(BaseChannel):
 
     async def _handle_sessions(self, update: Update, context: Any) -> None:
         """Handle /sessions — list sessions."""
+        self._touch()
         if not self._is_authorized(update.effective_user.id):
             return
 
@@ -236,42 +616,291 @@ class TelegramChannel(BaseChannel):
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
     async def _handle_new_session(self, update: Update, context: Any) -> None:
-        """Handle /new [title] — create and switch to a new session."""
+        """Handle /new [title] — stop current session, create and switch to a new one."""
+        self._touch()
         if not self._is_authorized(update.effective_user.id):
             return
         chat_id = update.effective_chat.id
+        channel_key = f"telegram:{chat_id}"
+
+        # Stop the current session before creating a new one
+        prev = await self.router.get_last_session(channel_key)
+        if prev:
+            stopped = await self.router.engine.stop_session(prev)
+            if stopped:
+                await update.message.reply_text(
+                    f"Stopped session `{prev}`.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
 
         title = " ".join(context.args) if context.args else None
         session_id = await self.router.create_session(
-            f"telegram:{chat_id}", title=title, source="telegram",
+            channel_key, title=title, source="telegram",
         )
         await update.message.reply_text(
             f"New session: `{session_id}`" + (f" — {title}" if title else ""),
             parse_mode=ParseMode.MARKDOWN,
         )
 
+    async def _handle_stop(self, update: Update, context: Any) -> None:
+        """Handle /stop — stop the currently running session."""
+        self._touch()
+        if not self._is_authorized(update.effective_user.id):
+            return
+        chat_id = update.effective_chat.id
+        channel_key = f"telegram:{chat_id}"
+
+        session_id = await self.router.get_last_session(channel_key)
+        if not session_id:
+            await update.message.reply_text("No active session.")
+            return
+
+        stopped = await self.router.engine.stop_session(session_id)
+        if stopped:
+            await update.message.reply_text(
+                f"Stopped session `{session_id}`.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            await update.message.reply_text("Nothing running to stop.")
+
     # ------------------------------------------------------------------ #
     #  Message handler — construct InboundMessage and delegate             #
     # ------------------------------------------------------------------ #
 
+    async def _extract_image(self, message: Any) -> dict[str, str] | None:
+        """Download and base64-encode an image from a Telegram message."""
+        if message.photo:
+            # Telegram provides multiple resolutions; pick the largest
+            photo = message.photo[-1]
+            tg_file = await photo.get_file()
+            data = await tg_file.download_as_bytearray()
+            return {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": base64.b64encode(bytes(data)).decode("utf-8"),
+            }
+        return None
+
     async def _handle_message(self, update: Update, context: Any) -> None:
-        """Handle incoming text messages — delegate to router."""
+        """Handle incoming text and photo messages — delegate to router."""
+        self._touch()
         if not self._is_authorized(update.effective_user.id):
             return
+
+        # Media group (album) — collect all parts before processing
+        if update.message.media_group_id:
+            await self._collect_media_group(update)
+            return
+
         chat_id = update.effective_chat.id
+        text = update.message.text or update.message.caption or ""
+
+        # Cache for reaction lookups (raw text, before reply-context prefix)
+        self._cache_message(update.message.message_id, chat_id, text)
+
+        # Prepend reply-to context and quote (if replying to a message)
+        reply_context = _format_reply_context(update.message)
+        if reply_context:
+            text = f"{reply_context}\n\n{text}" if text else reply_context
+
+        # Extract image if present
+        images: list[dict[str, str]] = []
+        image = await self._extract_image(update.message)
+        if image:
+            images.append(image)
+
+        if not text and not images:
+            return
+
+        logger.info(
+            "Telegram message from %s: %s%s",
+            chat_id,
+            (text[:80] + ("..." if len(text) > 80 else "")) if text else "(no text)",
+            f" [{len(images)} image(s)]" if images else "",
+        )
+
+        metadata: dict[str, Any] = {"message_id": update.message.message_id}
+        if images:
+            metadata["images"] = images
 
         msg = InboundMessage(
             channel_name="telegram",
             channel_key=f"telegram:{chat_id}",
             sender_id=str(chat_id),
-            text=update.message.text,
+            text=text,
+            metadata=metadata,
         )
 
         try:
             await self.router.handle_message(msg)
         except Exception as e:
-            logger.error("Agent error: %s", e)
-            await update.message.reply_text(f"Error: {e}")
+            logger.error("Agent error for chat %s: %s", chat_id, e, exc_info=True)
+            try:
+                await update.message.reply_text(f"Error: {e}")
+            except Exception:
+                logger.error("Failed to send error reply to chat %s", chat_id)
+
+    # ------------------------------------------------------------------ #
+    #  Reaction handler                                                    #
+    # ------------------------------------------------------------------ #
+
+    async def _handle_reaction(self, update: Update, context: Any) -> None:
+        """Handle message reaction updates — forward as text to router."""
+        self._touch()
+        reaction_update = update.message_reaction
+        if reaction_update is None:
+            return
+
+        user = reaction_update.user
+        if user is None or not self._is_authorized(user.id):
+            return
+
+        chat_id = reaction_update.chat.id
+        message_id = reaction_update.message_id
+
+        # Extract new emoji reactions (standard + premium custom emoji)
+        emojis = []
+        custom_ids = []
+        for r in reaction_update.new_reaction:
+            emoji = getattr(r, "emoji", None)
+            if emoji:
+                emojis.append(emoji)
+            else:
+                custom_id = getattr(r, "custom_emoji_id", None)
+                if custom_id:
+                    custom_ids.append(custom_id)
+
+        # Resolve premium custom emoji IDs to their base emoji
+        if custom_ids:
+            try:
+                stickers = await self._app.bot.get_custom_emoji_stickers(custom_ids)
+                for sticker in stickers:
+                    emojis.append(sticker.emoji or f"[premium:{sticker.custom_emoji_id}]")
+            except Exception as e:
+                logger.warning("Failed to resolve custom emoji: %s", e)
+                emojis.extend(f"[premium:{cid}]" for cid in custom_ids)
+
+        if not emojis:
+            # Reaction removed — ignore for now
+            return
+
+        emoji_str = " ".join(emojis)
+
+        # Look up original message text from cache
+        cached = self._message_cache.get(message_id)
+        if cached:
+            _, original_text = cached
+            text = f'[Reaction: {emoji_str} on message: "{original_text}"]'
+        else:
+            text = f"[Reaction: {emoji_str}]"
+
+        logger.info("Telegram reaction from %s: %s (msg %d)", chat_id, emoji_str, message_id)
+
+        msg = InboundMessage(
+            channel_name="telegram",
+            channel_key=f"telegram:{chat_id}",
+            sender_id=str(chat_id),
+            text=text,
+            metadata={},
+        )
+
+        try:
+            await self.router.handle_message(msg)
+        except Exception as e:
+            logger.error("Agent error for reaction in chat %s: %s", chat_id, e, exc_info=True)
+
+    # ------------------------------------------------------------------ #
+    #  Media group (album) collection                                     #
+    # ------------------------------------------------------------------ #
+
+    async def _collect_media_group(self, update: Update) -> None:
+        """Buffer a media-group message; schedule processing after a short delay."""
+        group_id = update.message.media_group_id
+        if group_id not in self._media_groups:
+            self._media_groups[group_id] = []
+        self._media_groups[group_id].append(update)
+
+        # Reset the timer — wait for remaining album parts
+        task = self._media_group_tasks.get(group_id)
+        if task:
+            task.cancel()
+        self._media_group_tasks[group_id] = asyncio.create_task(
+            self._process_media_group(group_id),
+        )
+
+    async def _process_media_group(self, group_id: str) -> None:
+        """Wait briefly for all album parts, then send as one message."""
+        await asyncio.sleep(0.5)
+
+        updates = self._media_groups.pop(group_id, [])
+        self._media_group_tasks.pop(group_id, None)
+        if not updates:
+            return
+
+        chat_id = updates[0].effective_chat.id
+
+        # Caption is usually on the first message only
+        text = ""
+        for u in updates:
+            caption = u.message.text or u.message.caption or ""
+            if caption:
+                text = caption
+                break
+
+        # Prepend reply-to context (album reply info is on the first message)
+        reply_context = _format_reply_context(updates[0].message)
+        if reply_context:
+            text = f"{reply_context}\n\n{text}" if text else reply_context
+
+        # Download all images
+        images: list[dict[str, str]] = []
+        for u in updates:
+            image = await self._extract_image(u.message)
+            if image:
+                images.append(image)
+
+        if not text and not images:
+            return
+
+        logger.info(
+            "Telegram media group from %s: %d image(s), caption: %s",
+            chat_id, len(images),
+            (text[:80] + "..." if len(text) > 80 else text) if text else "(none)",
+        )
+
+        metadata: dict[str, Any] = {"message_id": updates[0].message.message_id}
+        if images:
+            metadata["images"] = images
+
+        msg = InboundMessage(
+            channel_name="telegram",
+            channel_key=f"telegram:{chat_id}",
+            sender_id=str(chat_id),
+            text=text,
+            metadata=metadata,
+        )
+
+        try:
+            await self.router.handle_message(msg)
+        except Exception as e:
+            logger.error("Agent error for chat %s: %s", chat_id, e, exc_info=True)
+            try:
+                await updates[0].message.reply_text(f"Error: {e}")
+            except Exception:
+                logger.error("Failed to send error reply to chat %s", chat_id)
+
+    # ------------------------------------------------------------------ #
+    #  Error handler                                                       #
+    # ------------------------------------------------------------------ #
+
+    async def _handle_error(self, update: object, context: Any) -> None:
+        """Log errors from the Telegram bot polling/handler pipeline."""
+        self._touch()
+        logger.error(
+            "Telegram update error: %s (update=%s)",
+            context.error, update, exc_info=context.error,
+        )
 
     # ------------------------------------------------------------------ #
     #  Notification callback handlers                                      #
@@ -279,6 +908,7 @@ class TelegramChannel(BaseChannel):
 
     async def _handle_callback_query(self, update: Update, context: Any) -> None:
         """Handle inline keyboard button presses for notification questions."""
+        self._touch()
         query = update.callback_query
         if not query or not query.data:
             return
@@ -321,6 +951,7 @@ class TelegramChannel(BaseChannel):
 
     async def _handle_reply(self, update: Update, context: Any) -> None:
         """Handle /reply <text> — answer the most recent pending question."""
+        self._touch()
         if not self._is_authorized(update.effective_user.id):
             return
         if not context.args:

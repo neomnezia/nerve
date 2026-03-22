@@ -997,6 +997,7 @@ class AgentEngine:
         channel: str | None = None,
         model: str | None = None,
         internal: bool = False,
+        images: list[dict[str, Any]] | None = None,
     ) -> str:
         """Run the agent for a user message and return the final text response.
 
@@ -1004,12 +1005,28 @@ class AgentEngine:
             internal: If True, the user_message is a system-generated trigger
                       (e.g., background task completion) and won't be stored in
                       DB or shown in the UI.
+            images: Optional list of image dicts with keys ``type``,
+                    ``media_type``, and ``data`` (base64-encoded).
         """
+        # If the session is still running (e.g. /stop cleanup in progress),
+        # wait briefly instead of failing immediately.
         if self.sessions.is_running(session_id):
-            raise RuntimeError(f"Session {session_id} is already running")
+            for _ in range(10):
+                await asyncio.sleep(0.3)
+                if not self.sessions.is_running(session_id):
+                    break
+            else:
+                raise RuntimeError(f"Session {session_id} is already running")
 
         broadcaster.start_buffering(session_id)
         async with self._semaphore:
+            # Clear any stale deferred-stop flag left over from a *previous*
+            # turn.  If /stop arrived while the old turn was still cleaning up
+            # (mark_not_running hadn't run yet), the flag lingers and would
+            # immediately kill this brand-new turn.  Flags set *during* this
+            # turn's client init are unaffected — they're created after
+            # mark_running below.
+            self.sessions.pop_stop_request(session_id)
             self.sessions.mark_running(session_id)
             # Notify all connected clients that this session started running
             await broadcaster.broadcast("__global__", {
@@ -1020,7 +1037,7 @@ class AgentEngine:
             try:
                 return await self._run_inner(
                     session_id, user_message, source, channel, model,
-                    internal=internal,
+                    internal=internal, images=images,
                 )
             finally:
                 self.sessions.mark_not_running(session_id)
@@ -1040,6 +1057,7 @@ class AgentEngine:
         channel: str | None,
         model: str | None,
         internal: bool = False,
+        images: list[dict[str, Any]] | None = None,
     ) -> str:
         # Ensure session exists in DB
         await self.sessions.get_or_create(session_id, source=source)
@@ -1066,9 +1084,13 @@ class AgentEngine:
                     self._generate_session_title(session_id, user_message),
                 )
 
-            # Store user message in DB
+            # Store user message in DB (note attached images for display)
+            db_text = user_message
+            if images:
+                suffix = f"\n[{len(images)} image(s) attached]"
+                db_text = (user_message + suffix) if user_message else suffix.strip()
             await self.sessions.add_message(
-                session_id, "user", user_message, channel=channel,
+                session_id, "user", db_text, channel=channel,
             )
 
         full_response_text = ""
@@ -1096,10 +1118,48 @@ class AgentEngine:
                 session_id, source, model, fork_from=fork_from,
             )
 
+            # Check for deferred /stop that arrived while we were setting up
+            if self.sessions.pop_stop_request(session_id):
+                logger.info("Stop requested before agent turn — aborting session %s", session_id)
+                return ""
+
             # Send message — the client preserves conversation history internally
-            await client.query(user_message)
+            if images:
+                # Build multi-modal content blocks (text + images)
+                content_blocks: list[dict[str, Any]] = []
+                if user_message:
+                    content_blocks.append({"type": "text", "text": user_message})
+                for img in images:
+                    content_blocks.append({
+                        "type": "image",
+                        "source": {
+                            "type": img["type"],
+                            "media_type": img["media_type"],
+                            "data": img["data"],
+                        },
+                    })
+
+                async def _image_prompt():
+                    yield {
+                        "type": "user",
+                        "message": {"role": "user", "content": content_blocks},
+                        "parent_tool_use_id": None,
+                    }
+
+                await client.query(_image_prompt())
+            else:
+                await client.query(user_message)
 
             async for message in client.receive_response():
+                # Early-capture sdk_session_id from first message that
+                # carries it so it survives /stop cancellation (ResultMessage
+                # — the normal source — never arrives when the turn is
+                # interrupted).
+                if not sdk_session_id:
+                    msg_sid = getattr(message, "session_id", None)
+                    if msg_sid:
+                        sdk_session_id = msg_sid
+
                 if isinstance(message, AssistantMessage):
                     # Extract parent_tool_use_id — set when this message
                     # comes from a sub-agent (Task) rather than the main agent
@@ -1195,26 +1255,41 @@ class AgentEngine:
                 if full_response_text
                 else "[Stopped by user]"
             )
-            # Merge available tool results
-            self._merge_tool_results(tool_calls_log, tool_results_map)
-            await self.sessions.add_message(
-                session_id, "assistant", partial,
-                channel=channel,
-                thinking=thinking_text if thinking_text else None,
-                tool_calls=tool_calls_log if tool_calls_log else None,
-                blocks=ordered_blocks if ordered_blocks else None,
-            )
-            await broadcaster.broadcast(session_id, {
-                "type": "stopped", "session_id": session_id,
-            })
-            # Memorize before discarding client
-            await self._memorize_session(session_id)
-            # Keep sdk_session_id for resume — stop is user-initiated
+
+            # --- Critical cleanup first (must succeed for resume) ----------
+            # Persist sdk_session_id so the session can be resumed later.
+            # For new sessions the DB still has NULL because mark_active()
+            # was called before the SDK emitted any messages.
+            if sdk_session_id:
+                await self.db.update_session_fields(
+                    session_id, {"sdk_session_id": sdk_session_id},
+                )
             await self.sessions.mark_stopped(session_id)
             unregister_handler(session_id)
             client = self.sessions.remove_client(session_id)
             if client:
                 await self._safe_disconnect(client)
+
+            # --- Non-critical: save message, broadcast, memorize -----------
+            try:
+                self._merge_tool_results(tool_calls_log, tool_results_map)
+                await self.sessions.add_message(
+                    session_id, "assistant", partial,
+                    channel=channel,
+                    thinking=thinking_text if thinking_text else None,
+                    tool_calls=tool_calls_log if tool_calls_log else None,
+                    blocks=ordered_blocks if ordered_blocks else None,
+                )
+                await broadcaster.broadcast(session_id, {
+                    "type": "stopped", "session_id": session_id,
+                })
+            except Exception as cleanup_err:
+                logger.warning(
+                    "Non-critical stop cleanup failed for %s: %s",
+                    session_id, cleanup_err,
+                )
+            # Memorize in background — don't block the stop path
+            asyncio.create_task(self._memorize_session(session_id))
             return partial
 
         except Exception as e:

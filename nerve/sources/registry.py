@@ -7,7 +7,7 @@ as APScheduler jobs. Centralizes all source construction and config extraction.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from nerve.sources.runner import SourceRunner
 
@@ -34,12 +34,13 @@ def build_source_runners(
     ttl_days = config.sync.message_ttl_days
 
     # Build condense config from API credentials
-    condense_cfg: dict[str, str] | None = None
+    condense_cfg: dict[str, Any] | None = None
     if config.effective_api_key and config.memory.fast_model:
         condense_cfg = {
             "api_key": config.effective_api_key,
             "model": config.memory.fast_model,
             "base_url": config.anthropic_api_base_url,
+            "use_proxy": config.proxy.enabled,
         }
 
     # Telegram

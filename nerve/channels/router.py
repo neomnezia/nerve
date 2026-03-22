@@ -48,6 +48,9 @@ class ChannelRouter:
         self._channels: dict[str, BaseChannel] = {}
         # Active stream adapters: (channel_name, target) -> StreamAdapter
         self._adapters: dict[tuple[str, str], StreamAdapter] = {}
+        # Per-session inbound message context (for reaction support)
+        # Maps session_id -> {channel_name, target, message_id}
+        self._message_context: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------ #
     #  Channel registry                                                    #
@@ -102,6 +105,15 @@ class ChannelRouter:
                 msg.channel_key, source=msg.channel_name,
             )
 
+        # Store message context for reaction support
+        msg_id = msg.metadata.get("message_id") if msg.metadata else None
+        if msg_id is not None:
+            self._message_context[session_id] = {
+                "channel_name": msg.channel_name,
+                "target": msg.sender_id,
+                "message_id": msg_id,
+            }
+
         # Show typing indicator if supported
         if ChannelCapability.TYPING_INDICATOR in channel.capabilities:
             try:
@@ -114,18 +126,58 @@ class ChannelRouter:
             channel, msg.sender_id, session_id,
         )
 
-        try:
-            response = await self.engine.run(
+        # Extract images from metadata (e.g. Telegram photos)
+        images = msg.metadata.get("images") if msg.metadata else None
+
+        # Wrap in a Task so stop_session() can cancel it (otherwise
+        # channels that ``await engine.run()`` directly — like Telegram —
+        # have no cancellable task and /stop only sends an SDK interrupt
+        # which may hang indefinitely).
+        task = asyncio.create_task(
+            self.engine.run(
                 session_id=session_id,
                 user_message=msg.text,
                 source=msg.channel_name,
                 channel=msg.channel_name,
+                images=images,
             )
+        )
+        self.engine.register_task(session_id, task)
+        try:
+            response = await task
             return response
+        except asyncio.CancelledError:
+            # /stop cancelled the task — _run_inner already handled
+            # cleanup (persisted sdk_session_id, marked stopped, etc.).
+            # Return whatever partial response was captured.
+            if task.done() and not task.cancelled():
+                return task.result()
+            return ""
         finally:
             await self._teardown_streaming(
                 channel.name, msg.sender_id, session_id,
             )
+
+    # ------------------------------------------------------------------ #
+    #  Reactions                                                            #
+    # ------------------------------------------------------------------ #
+
+    async def set_reaction(self, session_id: str, emoji: str) -> bool:
+        """Set a reaction on the last inbound message for a session.
+
+        Returns True if the reaction was set, False if no context or
+        the channel does not support reactions.
+        """
+        ctx = self._message_context.get(session_id)
+        if not ctx:
+            return False
+
+        channel = self._channels.get(ctx["channel_name"])
+        if not channel or ChannelCapability.REACTIONS not in channel.capabilities:
+            return False
+
+        await channel.set_reaction(ctx["target"], ctx["message_id"], emoji)
+        return True
 
     # ------------------------------------------------------------------ #
     #  Interactive tool response routing                                    #

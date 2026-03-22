@@ -1121,6 +1121,10 @@ class MemUBridge:
                     prompt, *, max_tokens=None, system_prompt=None, temperature=0.2,
                     _orig=original_chat, _prof=profile,
                 ):
+                    # Anthropic API requires max_tokens >= 1; memU sometimes
+                    # omits it.  Default to 4096 to prevent 400 errors.
+                    if max_tokens is None:
+                        max_tokens = 4096
                     t0 = time.monotonic()
                     try:
                         return await asyncio.wait_for(
@@ -1546,6 +1550,9 @@ class MemUBridge:
             return self._anthropic_client
         import anthropic
         base_url = self.config.anthropic_api_base_url.rstrip("/")
+        # Strip /v1/ suffix — Anthropic SDK prepends it internally.
+        if base_url.endswith("/v1"):
+            base_url = base_url[:-3]
         self._anthropic_client = anthropic.Anthropic(
             api_key=self.config.effective_api_key,
             base_url=base_url,

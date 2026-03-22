@@ -44,6 +44,12 @@ class StreamAdapter:
         self._last_edit: float = 0.0
         self._edit_lock = asyncio.Lock()
 
+        # Tool label grouping (collapse consecutive same-tool calls)
+        self._last_tool_name: str | None = None
+        self._tool_run_count: int = 0
+        self._tool_label_start: int = 0
+        self._tool_label_prefix: str = "\n\n"
+
         # Precompute capability checks
         self._supports_streaming = (
             ChannelCapability.STREAMING in channel.capabilities
@@ -72,7 +78,17 @@ class StreamAdapter:
         elif msg_type == "tool_use":
             tool_name = message.get("tool", "unknown")
             if self._supports_streaming and self._supports_edit:
-                self._buffer += f"\n`[tool: {tool_name}]`\n"
+                if tool_name == self._last_tool_name:
+                    self._tool_run_count += 1
+                    self._buffer = self._buffer[:self._tool_label_start]
+                    self._buffer += f"{self._tool_label_prefix}`[{tool_name}] x{self._tool_run_count}`\n"
+                else:
+                    after_tool = self._last_tool_name is not None
+                    self._last_tool_name = tool_name
+                    self._tool_run_count = 1
+                    self._tool_label_start = len(self._buffer)
+                    self._tool_label_prefix = "" if after_tool else "\n\n"
+                    self._buffer += f"{self._tool_label_prefix}`[{tool_name}]`\n"
 
         elif msg_type == "done":
             await self._handle_done()
@@ -92,6 +108,10 @@ class StreamAdapter:
     # ------------------------------------------------------------------ #
 
     async def _handle_token(self, content: str) -> None:
+        if self._last_tool_name is not None:
+            # Transitioning from tool block to text — add blank line separator
+            self._buffer += "\n"
+        self._last_tool_name = None  # Reset tool grouping
         self._buffer += content
 
         if not self._supports_streaming or not self._supports_edit:
