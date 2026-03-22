@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import collections
 import html as _html
 import logging
 import re
@@ -18,7 +19,7 @@ from typing import Any, TYPE_CHECKING
 
 from telegram import Update
 from telegram.constants import ChatAction, ParseMode
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, MessageReactionHandler, filters
 
 from nerve.channels.base import (
     BaseChannel,
@@ -165,6 +166,11 @@ class TelegramChannel(BaseChannel):
         # Media group (album) collection: group_id -> list of updates
         self._media_groups: dict[str, list[Update]] = {}
         self._media_group_tasks: dict[str, asyncio.Task] = {}
+        # Message cache for reaction context: message_id -> (chat_id, text_snippet)
+        self._message_cache: collections.OrderedDict[int, tuple[int, str]] = (
+            collections.OrderedDict()
+        )
+        self._message_cache_max = 200
 
     def set_notification_service(self, service) -> None:
         """Wire the notification service for callback query handling."""
@@ -229,6 +235,7 @@ class TelegramChannel(BaseChannel):
             (filters.TEXT | filters.PHOTO) & ~filters.COMMAND,
             self._handle_message,
         ))
+        app.add_handler(MessageReactionHandler(self._handle_reaction))
         app.add_error_handler(self._handle_error)
 
         return app
@@ -249,6 +256,10 @@ class TelegramChannel(BaseChannel):
             # Retry initial connection indefinitely — don't give up on
             # transient network errors during startup
             bootstrap_retries=-1,
+            # Explicitly request all update types — the default set excludes
+            # message_reaction, and auto-detection only works via
+            # Application.run_polling(), not Updater.start_polling().
+            allowed_updates=Update.ALL_TYPES,
         )
         self._last_update_time = time.monotonic()
         logger.info("Telegram bot started polling (with TCP keepalive)")
@@ -397,6 +408,7 @@ class TelegramChannel(BaseChannel):
         await self._app.updater.start_polling(
             drop_pending_updates=False,
             bootstrap_retries=-1,
+            allowed_updates=Update.ALL_TYPES,
         )
         self._last_update_time = time.monotonic()
 
@@ -430,16 +442,17 @@ class TelegramChannel(BaseChannel):
             chunk = text[i:i + MAX_MSG_LEN]
             html_chunk = _md_to_tg_html(chunk)
             try:
-                await self._app.bot.send_message(
+                sent = await self._app.bot.send_message(
                     chat_id=chat_id,
                     text=html_chunk,
                     parse_mode=ParseMode.HTML,
                 )
             except Exception:
-                await self._app.bot.send_message(
+                sent = await self._app.bot.send_message(
                     chat_id=chat_id,
                     text=chunk,
                 )
+            self._cache_message(sent.message_id, chat_id, chunk)
 
     def format_response(self, text: str) -> str:
         """Truncate for Telegram if needed."""
@@ -486,6 +499,8 @@ class TelegramChannel(BaseChannel):
                 )
             except Exception:
                 pass
+        # Update cache with the latest text (streaming overwrites placeholder)
+        self._cache_message(int(message_id), int(target), text)
 
     async def send_typing(self, target: str) -> None:
         """Show typing indicator."""
@@ -495,6 +510,21 @@ class TelegramChannel(BaseChannel):
             chat_id=int(target),
             action=ChatAction.TYPING,
         )
+
+    # ------------------------------------------------------------------ #
+    #  Message cache (for reaction context)                                #
+    # ------------------------------------------------------------------ #
+
+    def _cache_message(self, message_id: int, chat_id: int, text: str) -> None:
+        """Store a message snippet in the LRU cache for reaction lookups."""
+        snippet = text[:200] if text else ""
+        if not snippet:
+            return
+        self._message_cache[message_id] = (chat_id, snippet)
+        # Move to end (most recent) and evict oldest if over limit
+        self._message_cache.move_to_end(message_id)
+        while len(self._message_cache) > self._message_cache_max:
+            self._message_cache.popitem(last=False)
 
     # ------------------------------------------------------------------ #
     #  Auth                                                                #
@@ -651,6 +681,9 @@ class TelegramChannel(BaseChannel):
         chat_id = update.effective_chat.id
         text = update.message.text or update.message.caption or ""
 
+        # Cache for reaction lookups (raw text, before reply-context prefix)
+        self._cache_message(update.message.message_id, chat_id, text)
+
         # Prepend reply-to context and quote (if replying to a message)
         reply_context = _format_reply_context(update.message)
         if reply_context:
@@ -688,6 +721,60 @@ class TelegramChannel(BaseChannel):
                 await update.message.reply_text(f"Error: {e}")
             except Exception:
                 logger.error("Failed to send error reply to chat %s", chat_id)
+
+    # ------------------------------------------------------------------ #
+    #  Reaction handler                                                    #
+    # ------------------------------------------------------------------ #
+
+    async def _handle_reaction(self, update: Update, context: Any) -> None:
+        """Handle message reaction updates — forward as text to router."""
+        self._touch()
+        reaction_update = update.message_reaction
+        if reaction_update is None:
+            return
+
+        user = reaction_update.user
+        if user is None or not self._is_authorized(user.id):
+            return
+
+        chat_id = reaction_update.chat.id
+        message_id = reaction_update.message_id
+
+        # Extract new emoji reactions
+        emojis = []
+        for r in reaction_update.new_reaction:
+            emoji = getattr(r, "emoji", None)
+            if emoji:
+                emojis.append(emoji)
+
+        if not emojis:
+            # Reaction removed — ignore for now
+            return
+
+        emoji_str = " ".join(emojis)
+
+        # Look up original message text from cache
+        cached = self._message_cache.get(message_id)
+        if cached:
+            _, original_text = cached
+            text = f'[Reaction: {emoji_str} on message: "{original_text}"]'
+        else:
+            text = f"[Reaction: {emoji_str}]"
+
+        logger.info("Telegram reaction from %s: %s (msg %d)", chat_id, emoji_str, message_id)
+
+        msg = InboundMessage(
+            channel_name="telegram",
+            channel_key=f"telegram:{chat_id}",
+            sender_id=str(chat_id),
+            text=text,
+            metadata={},
+        )
+
+        try:
+            await self.router.handle_message(msg)
+        except Exception as e:
+            logger.error("Agent error for reaction in chat %s: %s", chat_id, e, exc_info=True)
 
     # ------------------------------------------------------------------ #
     #  Media group (album) collection                                     #
