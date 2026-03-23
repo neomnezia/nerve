@@ -43,7 +43,7 @@ step()    { printf "\n${BOLD}${CYAN}==> %s${NC}\n" "$1"; }
 confirm() {
     if [ "$AUTO_YES" = "1" ]; then return 0; fi
     printf "${BOLD}  %s [Y/n]${NC} " "$1"
-    read -r response < /dev/tty
+    read -r response
     case "$response" in
         [nN]|[nN][oO]) return 1 ;;
         *) return 0 ;;
@@ -457,9 +457,7 @@ run_init() {
     fi
 
     cd "$INSTALL_DIR"
-    # Redirect stdin from /dev/tty so the interactive wizard works
-    # even when the installer is piped via curl | bash
-    "$nerve_bin" init < /dev/tty
+    "$nerve_bin" init
 }
 
 # --- Summary ---
@@ -531,6 +529,12 @@ main() {
             --help|-h) usage; exit 0 ;;
         esac
     done
+
+    # When piped via curl | bash, stdin is the pipe (EOF after script).
+    # Reclaim the terminal for all interactive prompts.
+    if [ ! -t 0 ] && [ -e /dev/tty ]; then
+        exec < /dev/tty
+    fi
 
     printf "\n"
     printf "${BOLD}${CYAN}  ╔══════════════════════════════════════════╗${NC}\n"
