@@ -301,6 +301,27 @@ class ChannelRouter:
         return True
 
     # ------------------------------------------------------------------ #
+    #  Stickers                                                             #
+    # ------------------------------------------------------------------ #
+
+    async def send_sticker(self, session_id: str, sticker: str) -> bool:
+        """Send a sticker to the chat associated with a session.
+
+        Returns True if the sticker was sent, False if no context or
+        the channel does not support stickers.
+        """
+        ctx = self._message_context.get(session_id)
+        if not ctx:
+            return False
+
+        channel = self._channels.get(ctx["channel_name"])
+        if not channel or not hasattr(channel, "send_sticker"):
+            return False
+
+        await channel.send_sticker(ctx["target"], sticker)
+        return True
+
+    # ------------------------------------------------------------------ #
     #  Interactive tool response routing                                    #
     # ------------------------------------------------------------------ #
 

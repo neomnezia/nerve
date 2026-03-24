@@ -283,7 +283,7 @@ class TelegramChannel(BaseChannel):
         app.add_handler(CommandHandler("reply", self._handle_reply))
         app.add_handler(CallbackQueryHandler(self._handle_callback_query))
         app.add_handler(MessageHandler(
-            filters.TEXT | filters.PHOTO | filters.COMMAND,
+            filters.TEXT | filters.PHOTO | filters.COMMAND | filters.Sticker.ALL,
             self._handle_message,
         ))
         app.add_handler(MessageReactionHandler(self._handle_reaction))
@@ -588,6 +588,19 @@ class TelegramChannel(BaseChannel):
         )
 
     # ------------------------------------------------------------------ #
+    #  Stickers: send a sticker by file_id                                 #
+    # ------------------------------------------------------------------ #
+
+    async def send_sticker(self, target: str, sticker: str) -> None:
+        """Send a sticker to a Telegram chat by file_id."""
+        if self._app is None:
+            return
+        await self._app.bot.send_sticker(
+            chat_id=int(target),
+            sticker=sticker,
+        )
+
+    # ------------------------------------------------------------------ #
     #  Message cache (for reaction context)                                #
     # ------------------------------------------------------------------ #
 
@@ -769,6 +782,57 @@ class TelegramChannel(BaseChannel):
             }
         return None
 
+    async def _extract_sticker(
+        self, message: Any,
+    ) -> tuple[dict[str, str] | None, str]:
+        """Extract sticker image and context text from a Telegram message.
+
+        Returns (image_dict_or_None, context_text).
+        Static stickers (.webp) are downloaded as full images.
+        Animated/video stickers use their thumbnail instead.
+        """
+        sticker = getattr(message, "sticker", None)
+        if not sticker:
+            return None, ""
+
+        emoji = sticker.emoji or ""
+        set_name = sticker.set_name or ""
+        file_id = sticker.file_id
+
+        # Build human-readable context
+        parts = []
+        if emoji:
+            parts.append(emoji)
+        if set_name:
+            parts.append(f'set "{set_name}"')
+        context = f'[Sticker: {", ".join(parts)}, file_id: {file_id}]'
+
+        # Download image — static stickers are WEBP; animated/video use thumbnail
+        image: dict[str, str] | None = None
+        try:
+            if sticker.is_animated or sticker.is_video:
+                thumb = sticker.thumbnail
+                if thumb:
+                    tg_file = await thumb.get_file()
+                    data = await tg_file.download_as_bytearray()
+                    image = {
+                        "type": "base64",
+                        "media_type": "image/webp",
+                        "data": base64.b64encode(bytes(data)).decode("utf-8"),
+                    }
+            else:
+                tg_file = await sticker.get_file()
+                data = await tg_file.download_as_bytearray()
+                image = {
+                    "type": "base64",
+                    "media_type": "image/webp",
+                    "data": base64.b64encode(bytes(data)).decode("utf-8"),
+                }
+        except Exception as e:
+            logger.warning("Failed to download sticker image: %s", e)
+
+        return image, context
+
     async def _handle_message(self, update: Update, context: Any) -> None:
         """Handle incoming text and photo messages — delegate to router."""
         self._touch()
@@ -801,6 +865,13 @@ class TelegramChannel(BaseChannel):
         image = await self._extract_image(update.message)
         if image:
             images.append(image)
+
+        # Extract sticker if present
+        sticker_image, sticker_context = await self._extract_sticker(update.message)
+        if sticker_context:
+            text = f"{sticker_context}\n\n{text}" if text else sticker_context
+        if sticker_image:
+            images.append(sticker_image)
 
         if not text and not images:
             return

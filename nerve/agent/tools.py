@@ -1695,6 +1695,24 @@ async def _react_impl(args: dict, session_id: str) -> dict:
         return {"content": [{"type": "text", "text": f"Failed to set reaction: {e}"}]}
 
 
+async def _send_sticker_impl(args: dict, session_id: str) -> dict:
+    """Core implementation for the send_sticker tool."""
+    if not _engine:
+        return {"content": [{"type": "text", "text": "Engine not available."}]}
+
+    sticker = args["sticker"]
+
+    try:
+        success = await _engine.router.send_sticker(session_id, sticker)
+        if success:
+            return {"content": [{"type": "text", "text": "Sticker sent."}]}
+        else:
+            return {"content": [{"type": "text", "text": "Cannot send sticker: no message context or channel does not support stickers."}]}
+    except Exception as e:
+        logger.error("send_sticker tool failed: %s", e)
+        return {"content": [{"type": "text", "text": f"Failed to send sticker: {e}"}]}
+
+
 _nerve_asgi_app = None  # Cached mini FastAPI app for in-process API calls
 
 
@@ -1826,6 +1844,22 @@ async def react_tool(args: dict) -> dict:
 
 
 @tool(
+    "send_sticker",
+    "Send a Telegram sticker to the current chat. "
+    "Use the file_id received when a user sends you a sticker.",
+    {
+        "sticker": {
+            "type": "string",
+            "description": "Telegram sticker file_id. Included in [Sticker: ..., file_id: ...] when users send stickers.",
+        },
+    },
+)
+async def send_sticker_tool(args: dict) -> dict:
+    """Send a sticker (fallback — uses deprecated global)."""
+    return await _send_sticker_impl(args, _current_session_id)
+
+
+@tool(
     "ask_user",
     "Ask the user a question via async notification. "
     "Returns immediately — when the user answers, their reply is "
@@ -1885,6 +1919,13 @@ _REACT_SCHEMA = {
     "emoji": {"type": "string", "description": "Emoji to react with (e.g., '👍', '❤', '🔥', '😂')"},
 }
 
+_SEND_STICKER_SCHEMA = {
+    "sticker": {
+        "type": "string",
+        "description": "Telegram sticker file_id. Included in [Sticker: ..., file_id: ...] when users send stickers.",
+    },
+}
+
 
 def create_session_mcp_server(session_id: str):
     """Create an MCP server with session_id bound for session-scoped tools.
@@ -1926,8 +1967,19 @@ def create_session_mcp_server(session_id: str):
         # session_id captured from enclosing scope — race-free
         return await _react_impl(args, session_id)
 
+    @tool(
+        "send_sticker",
+        "Send a Telegram sticker to the current chat. "
+        "Use the file_id received when a user sends you a sticker.",
+        _SEND_STICKER_SCHEMA,
+    )
+    async def session_send_sticker(args: dict) -> dict:
+        # session_id captured from enclosing scope — race-free
+        return await _send_sticker_impl(args, session_id)
+
     # Shared tools (don't need session context) + session-scoped tools
-    shared_tools = [t for t in ALL_TOOLS if t.name not in ("notify", "ask_user", "react")]
-    all_tools = shared_tools + [session_notify, session_ask_user, session_react]
+    _SESSION_SCOPED = {"notify", "ask_user", "react", "send_sticker"}
+    shared_tools = [t for t in ALL_TOOLS if t.name not in _SESSION_SCOPED]
+    all_tools = shared_tools + [session_notify, session_ask_user, session_react, session_send_sticker]
 
     return create_sdk_mcp_server(name="nerve", version="1.0.0", tools=all_tools)
