@@ -1798,6 +1798,42 @@ def _hoa_text(text: str) -> dict:
     """Shorthand for MCP tool text response."""
     return {"content": [{"type": "text", "text": text}]}
 
+
+def _format_hoa_event_log(events: list[dict]) -> str:
+    """Format HoA progress events into a readable log for the tool result."""
+    if not events:
+        return ""
+    lines = ["## Execution Log"]
+    for ev in events:
+        event_type = ev.get("event", "")
+        label = ev.get("label", "")
+        agent = ev.get("agent", "")
+        message = ev.get("message", "")
+        iteration = ev.get("iteration")
+        loop_pass = ev.get("loop_pass")
+
+        if event_type == "run_info":
+            mode = ev.get("mode", "?")
+            agents = ev.get("agents", [])
+            lines.append(f"- **Run started** — mode: {mode}, agents: {', '.join(agents) if agents else 'from pipeline'}")
+        elif event_type == "block_started":
+            suffix = f" (iter {iteration})" if iteration and iteration > 1 else ""
+            loop_suffix = f" [loop {loop_pass}]" if loop_pass and loop_pass > 0 else ""
+            lines.append(f"- **{label or 'Block'}** started{suffix}{loop_suffix} → {agent}")
+        elif event_type == "block_finished":
+            lines.append(f"- **{label or 'Block'}** finished → {agent}")
+        elif event_type == "block_skipped":
+            lines.append(f"- **{label or 'Block'}** skipped")
+        elif event_type == "iteration_complete":
+            lines.append(f"- Iteration {iteration} complete")
+        elif event_type == "all_done":
+            lines.append(f"- **All done**")
+        elif event_type == "error":
+            lines.append(f"- ❌ Error: {message}")
+        # Skip verbose block_log / run_dir events from the summary
+
+    return "\n".join(lines) if len(lines) > 1 else ""
+
 @tool(
     "hoa_status",
     "Check houseofagents multi-agent runtime availability and version. "
@@ -1978,6 +2014,9 @@ def create_session_mcp_server(session_id: str):
             session_id=session_id,   # captured from enclosing scope → enables progress streaming
         )
 
+        # Build event log for the tool result (persists to DB, survives page reload)
+        event_log = _format_hoa_event_log(result.events)
+
         if result.success:
             output_parts = []
             if result.output_dir:
@@ -1986,14 +2025,15 @@ def create_session_mcp_server(session_id: str):
                 output_parts.append(json.dumps(result.stdout_json, indent=2))
             elif result.stdout_raw:
                 output_parts.append(result.stdout_raw)
-            if result.events:
-                output_parts.append(f"\n{len(result.events)} progress events received.")
+            if event_log:
+                output_parts.append(event_log)
             return _hoa_text("\n\n".join(output_parts) if output_parts else "Completed successfully.")
         else:
-            return _hoa_text(
-                f"houseofagents exited with code {result.exit_code}\n\n"
-                f"stderr:\n{result.stderr_log[:2000]}"
-            )
+            parts = [f"houseofagents exited with code {result.exit_code}"]
+            if event_log:
+                parts.append(event_log)
+            parts.append(f"stderr:\n{result.stderr_log[:2000]}")
+            return _hoa_text("\n\n".join(parts))
 
     # Shared tools (don't need session context) + session-scoped tools
     shared_tools = [t for t in ALL_TOOLS if t.name not in ("notify", "ask_user", "react")]

@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Users, Loader2, ChevronDown, ChevronRight, Check, X } from 'lucide-react';
 import type { ToolCallBlockData } from '../../../types/chat';
+import { MarkdownContent } from '../MarkdownContent';
 
 const PROVIDER_COLORS: Record<string, string> = {
   anthropic: 'bg-orange-400/20 text-orange-300 border-orange-400/30',
@@ -116,9 +117,15 @@ export function HoAToolBlock({ block }: { block: ToolCallBlockData }) {
               <div className="text-[10px] uppercase tracking-wider text-[#555] mb-1">
                 {block.isError ? 'Error' : 'Result'}
               </div>
-              <pre className={`text-[12px] font-mono whitespace-pre-wrap overflow-x-auto max-h-80 overflow-y-auto bg-[#0f0f0f] rounded p-2 border border-[#222] ${block.isError ? 'text-red-400' : 'text-[#999]'}`}>
-                {block.result}
-              </pre>
+              {block.isError ? (
+                <pre className="text-[12px] font-mono whitespace-pre-wrap overflow-x-auto max-h-80 overflow-y-auto bg-[#0f0f0f] rounded p-2 border border-[#222] text-red-400">
+                  {block.result}
+                </pre>
+              ) : (
+                <div className="text-[12px] text-[#999] max-h-96 overflow-y-auto bg-[#0f0f0f] rounded p-3 border border-[#222]">
+                  <MarkdownContent content={block.result} />
+                </div>
+              )}
             </div>
           )}
         </div>
