@@ -283,7 +283,7 @@ class TelegramChannel(BaseChannel):
         app.add_handler(CommandHandler("reply", self._handle_reply))
         app.add_handler(CallbackQueryHandler(self._handle_callback_query))
         app.add_handler(MessageHandler(
-            filters.TEXT | filters.PHOTO | filters.COMMAND | filters.Sticker.ALL,
+            filters.TEXT | filters.PHOTO | filters.COMMAND | filters.Sticker.ALL | filters.Document.ALL,
             self._handle_message,
         ))
         app.add_handler(MessageReactionHandler(self._handle_reaction))
@@ -833,6 +833,120 @@ class TelegramChannel(BaseChannel):
 
         return image, context
 
+    # Known text-like MIME types (beyond text/*)
+    _TEXT_MIME_EXTRAS: set[str] = {
+        "application/json",
+        "application/xml",
+        "application/javascript",
+        "application/x-yaml",
+        "application/yaml",
+        "application/toml",
+        "application/x-sh",
+        "application/x-python",
+        "application/sql",
+        "application/x-httpd-php",
+        "application/xhtml+xml",
+        "application/csv",
+    }
+
+    # Extensions treated as text when MIME type is missing or generic
+    _TEXT_EXTENSIONS: set[str] = {
+        ".txt", ".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".yaml", ".yml",
+        ".toml", ".xml", ".html", ".htm", ".css", ".scss", ".less",
+        ".md", ".rst", ".csv", ".tsv", ".sql", ".sh", ".bash", ".zsh",
+        ".rb", ".go", ".rs", ".java", ".kt", ".c", ".cpp", ".h", ".hpp",
+        ".swift", ".lua", ".r", ".m", ".pl", ".php", ".env", ".ini", ".cfg",
+        ".conf", ".log", ".diff", ".patch", ".vue", ".svelte",
+    }
+
+    _IMAGE_MIMES: set[str] = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+
+    _MAX_TEXT_SIZE: int = 512 * 1024       # 512 KB — inline text cap
+    _MAX_DOWNLOAD_SIZE: int = 20_000_000   # ~20 MB — Telegram Bot API limit
+
+    async def _extract_document(
+        self, message: Any,
+    ) -> tuple[dict[str, str] | None, str]:
+        """Extract document content and context from a Telegram message.
+
+        Returns (content_block_or_None, context_text).
+        - Text files: content is None (text inlined in context), context has file content.
+        - Images sent as documents: content is base64 image dict.
+        - PDFs: content is base64 document dict.
+        - Other: content is None, context has metadata only.
+        """
+        doc = getattr(message, "document", None)
+        if not doc:
+            return None, ""
+
+        file_name = doc.file_name or "unnamed"
+        mime = doc.mime_type or ""
+        size = doc.file_size or 0
+        ext = ""
+        if "." in file_name:
+            ext = "." + file_name.rsplit(".", 1)[-1].lower()
+
+        size_str = (
+            f"{size / 1024:.0f} KB" if size < 1_000_000
+            else f"{size / 1_000_000:.1f} MB"
+        )
+        meta_line = f"[Document: {file_name} ({size_str}, {mime or 'unknown type'})]"
+
+        # -- Too large to download via Bot API --
+        if size > self._MAX_DOWNLOAD_SIZE:
+            return None, f"{meta_line}\n(File too large to download)"
+
+        # -- Text-like files --
+        is_text = (
+            mime.startswith("text/")
+            or mime in self._TEXT_MIME_EXTRAS
+            or ext in self._TEXT_EXTENSIONS
+        )
+        if is_text:
+            if size > self._MAX_TEXT_SIZE:
+                return None, f"{meta_line}\n(Text file too large to display — {size_str})"
+            try:
+                tg_file = await doc.get_file()
+                data = await tg_file.download_as_bytearray()
+                content = bytes(data).decode("utf-8", errors="replace")
+                return None, f"{meta_line}\n```\n{content}\n```"
+            except Exception as e:
+                logger.warning("Failed to download text document %s: %s", file_name, e)
+                return None, meta_line
+
+        # -- Image files sent as documents --
+        if mime in self._IMAGE_MIMES:
+            try:
+                tg_file = await doc.get_file()
+                data = await tg_file.download_as_bytearray()
+                image = {
+                    "type": "base64",
+                    "media_type": mime,
+                    "data": base64.b64encode(bytes(data)).decode("utf-8"),
+                }
+                return image, meta_line
+            except Exception as e:
+                logger.warning("Failed to download image document %s: %s", file_name, e)
+                return None, meta_line
+
+        # -- PDF --
+        if mime == "application/pdf" or ext == ".pdf":
+            try:
+                tg_file = await doc.get_file()
+                data = await tg_file.download_as_bytearray()
+                pdf_block = {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": base64.b64encode(bytes(data)).decode("utf-8"),
+                }
+                return pdf_block, meta_line
+            except Exception as e:
+                logger.warning("Failed to download PDF %s: %s", file_name, e)
+                return None, meta_line
+
+        # -- Other binary files — metadata only --
+        return None, meta_line
+
     async def _handle_message(self, update: Update, context: Any) -> None:
         """Handle incoming text and photo messages — delegate to router."""
         self._touch()
@@ -872,6 +986,13 @@ class TelegramChannel(BaseChannel):
             text = f"{sticker_context}\n\n{text}" if text else sticker_context
         if sticker_image:
             images.append(sticker_image)
+
+        # Extract document/file if present
+        doc_content, doc_context = await self._extract_document(update.message)
+        if doc_context:
+            text = f"{doc_context}\n\n{text}" if text else doc_context
+        if doc_content:
+            images.append(doc_content)
 
         if not text and not images:
             return

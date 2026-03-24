@@ -1812,17 +1812,58 @@ async def mcp_reload(args: dict) -> dict:
         return {"content": [{"type": "text", "text": f"Reload failed: {e}"}]}
 
 
+# Notification tool schemas — shared between module-level and session-scoped definitions.
+# Must be proper JSON Schema (with "type"/"properties"/"required") so the SDK
+# preserves them as-is instead of converting and marking everything required.
+_NOTIFY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string", "description": "Short notification title (shown as heading)", "default": ""},
+        "body": {"type": "string", "description": "Notification body with details (markdown supported)"},
+        "priority": {"type": "string", "description": "Priority level: 'low', 'normal', 'high', 'urgent'. Default: 'normal'", "default": "normal"},
+    },
+    "required": ["body"],
+}
+
+_ASK_USER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string", "description": "The question to ask"},
+        "body": {"type": "string", "description": "Additional context for the question (markdown supported)", "default": ""},
+        "options": {"type": "string", "description": "Predefined answer options (shown as buttons). Comma-separated string or JSON array. Optional — user can always type free text.", "default": ""},
+        "wait": {"type": "string", "description": "If 'true', block agent execution until user answers. Default: 'false' (async).", "default": "false"},
+        "priority": {"type": "string", "description": "Priority: 'low', 'normal', 'high', 'urgent'. Default: 'normal'", "default": "normal"},
+    },
+    "required": ["title"],
+}
+
+_REACT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "emoji": {"type": "string", "description": "Emoji to react with (e.g., '👍', '❤', '🔥', '😂')"},
+    },
+    "required": ["emoji"],
+}
+
+_SEND_STICKER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "sticker": {
+            "type": "string",
+            "description": "Telegram sticker file_id. Included in [Sticker: ..., file_id: ...] when users send stickers.",
+        },
+    },
+    "required": ["sticker"],
+}
+
+
 # Module-level tool definitions — used only for ALL_TOOLS reference.
 # Actual session-scoped tools are created by create_session_mcp_server().
 @tool(
     "notify",
     "Send an async notification to the user. Fire-and-forget — does not wait for a response. "
     "Use for status updates, completion alerts, reminders, or any message that doesn't need a reply.",
-    {
-        "title": {"type": "string", "description": "Short notification title (shown as heading)"},
-        "body": {"type": "string", "description": "Optional notification body with details (markdown supported)", "default": ""},
-        "priority": {"type": "string", "description": "Priority level: 'low', 'normal', 'high', 'urgent'. Default: 'normal'", "default": "normal"},
-    },
+    _NOTIFY_SCHEMA,
 )
 async def notify(args: dict) -> dict:
     """Send a fire-and-forget notification (fallback — uses deprecated global)."""
@@ -1834,9 +1875,7 @@ async def notify(args: dict) -> dict:
     "Set an emoji reaction on the user's last message. "
     "Use to acknowledge messages, express emotions, or respond non-verbally. "
     "Works on channels that support reactions (e.g., Telegram).",
-    {
-        "emoji": {"type": "string", "description": "Emoji to react with (e.g., '👍', '❤', '🔥', '😂')"},
-    },
+    _REACT_SCHEMA,
 )
 async def react_tool(args: dict) -> dict:
     """Set a reaction (fallback — uses deprecated global)."""
@@ -1847,12 +1886,7 @@ async def react_tool(args: dict) -> dict:
     "send_sticker",
     "Send a Telegram sticker to the current chat. "
     "Use the file_id received when a user sends you a sticker.",
-    {
-        "sticker": {
-            "type": "string",
-            "description": "Telegram sticker file_id. Included in [Sticker: ..., file_id: ...] when users send stickers.",
-        },
-    },
+    _SEND_STICKER_SCHEMA,
 )
 async def send_sticker_tool(args: dict) -> dict:
     """Send a sticker (fallback — uses deprecated global)."""
@@ -1865,13 +1899,7 @@ async def send_sticker_tool(args: dict) -> dict:
     "Returns immediately — when the user answers, their reply is "
     "automatically injected into this session. "
     "Use predefined options for quick answers (rendered as buttons), or the user can type a free-text reply.",
-    {
-        "title": {"type": "string", "description": "The question to ask"},
-        "body": {"type": "string", "description": "Additional context for the question (markdown supported)", "default": ""},
-        "options": {"type": "string", "description": "Predefined answer options (shown as buttons). Comma-separated string or JSON array. Optional — user can always type free text.", "default": ""},
-        "wait": {"type": "string", "description": "If 'true', block agent execution until user answers. Default: 'false' (async).", "default": "false"},
-        "priority": {"type": "string", "description": "Priority: 'low', 'normal', 'high', 'urgent'. Default: 'normal'", "default": "normal"},
-    },
+    _ASK_USER_SCHEMA,
 )
 async def ask_user_tool(args: dict) -> dict:
     """Ask the user a question asynchronously (fallback — uses deprecated global)."""
@@ -1898,33 +1926,6 @@ def create_nerve_mcp_server():
         version="1.0.0",
         tools=ALL_TOOLS,
     )
-
-
-# Notification tool schemas — shared between module-level and session-scoped definitions
-_NOTIFY_SCHEMA = {
-    "title": {"type": "string", "description": "Short notification title (shown as heading)", "default": ""},
-    "body": {"type": "string", "description": "Optional notification body with details (markdown supported)", "default": ""},
-    "priority": {"type": "string", "description": "Priority level: 'low', 'normal', 'high', 'urgent'. Default: 'normal'", "default": "normal"},
-}
-
-_ASK_USER_SCHEMA = {
-    "title": {"type": "string", "description": "The question to ask"},
-    "body": {"type": "string", "description": "Additional context for the question (markdown supported)", "default": ""},
-    "options": {"type": "string", "description": "Predefined answer options (shown as buttons). Comma-separated string or JSON array. Optional — user can always type free text.", "default": ""},
-    "wait": {"type": "string", "description": "If 'true', block agent execution until user answers. Default: 'false' (async).", "default": "false"},
-    "priority": {"type": "string", "description": "Priority: 'low', 'normal', 'high', 'urgent'. Default: 'normal'", "default": "normal"},
-}
-
-_REACT_SCHEMA = {
-    "emoji": {"type": "string", "description": "Emoji to react with (e.g., '👍', '❤', '🔥', '😂')"},
-}
-
-_SEND_STICKER_SCHEMA = {
-    "sticker": {
-        "type": "string",
-        "description": "Telegram sticker file_id. Included in [Sticker: ..., file_id: ...] when users send stickers.",
-    },
-}
 
 
 def create_session_mcp_server(session_id: str):
