@@ -46,11 +46,10 @@ async def _tail_session_jsonl(
     from nerve.agent.streaming import StreamBroadcaster as _SB  # noqa: F811 — type hint
 
     # Claude CLI writes session logs to ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
-    # The cwd is the workspace, encoded as dash-separated path segments.
+    # The cwd is encoded by replacing / with - (keeping the leading dash for absolute paths).
     cwd_encoded = workspace.replace("/", "-")
-    if cwd_encoded.startswith("-"):
-        cwd_encoded = cwd_encoded[1:]
-    jsonl_path = Path.home() / ".claude" / "projects" / cwd_encoded / f"{inner_session_id}.jsonl"
+    projects_dir = Path.home() / ".claude" / "projects"
+    jsonl_path = projects_dir / cwd_encoded / f"{inner_session_id}.jsonl"
 
     # Wait for the file to appear (claude CLI creates it after init)
     for _ in range(30):
@@ -58,7 +57,7 @@ async def _tail_session_jsonl(
             break
         await asyncio.sleep(1)
     else:
-        logger.debug("JSONL not found for session %s at %s", inner_session_id, jsonl_path)
+        logger.warning("JSONL not found for session %s at %s", inner_session_id, jsonl_path)
         return
 
     logger.info("Tailing inner session %s → %s", inner_session_id, jsonl_path)

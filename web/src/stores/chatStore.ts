@@ -1190,6 +1190,17 @@ function applyStreamEvent(blocks: MessageBlock[], event: WSMessage): MessageBloc
       }
       break;
     }
+    case 'hoa_progress': {
+      for (let i = result.length - 1; i >= 0; i--) {
+        const b = result[i];
+        if (b.type === 'tool_call' && b.tool.includes('hoa_execute')) {
+          const prev = b.hoaEvents || [];
+          result[i] = { ...b, hoaEvents: [...prev, (event as any).event] };
+          break;
+        }
+      }
+      break;
+    }
   }
   return result;
 }
