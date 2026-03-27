@@ -23,7 +23,7 @@ Ship a **personal assistant** that develops a personality, remembers your prefer
 ## Quick Start
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/pufit/nerve/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ClickHouse/nerve/main/install.sh | bash
 ```
 
 The installer handles everything — installs dependencies (Python, Node.js, uv), clones the repo, builds the web UI, and launches the interactive setup wizard.
