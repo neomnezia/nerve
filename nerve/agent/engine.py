@@ -671,9 +671,19 @@ class AgentEngine:
     def _build_env(self) -> dict[str, str]:
         """Build environment variables for the SDK subprocess."""
         env: dict[str, str] = {}
-        api_key = self.config.effective_api_key
-        if api_key:
-            env["ANTHROPIC_API_KEY"] = api_key
+        if self.config.provider.is_bedrock:
+            env["CLAUDE_CODE_USE_BEDROCK"] = "1"
+            if self.config.provider.aws_region:
+                env["AWS_REGION"] = self.config.provider.aws_region
+            if self.config.provider.aws_profile:
+                env["AWS_PROFILE"] = self.config.provider.aws_profile
+            if self.config.provider.aws_access_key_id:
+                env["AWS_ACCESS_KEY_ID"] = self.config.provider.aws_access_key_id
+                env["AWS_SECRET_ACCESS_KEY"] = self.config.provider.aws_secret_access_key
+        else:
+            api_key = self.config.effective_api_key
+            if api_key:
+                env["ANTHROPIC_API_KEY"] = api_key
         return env
 
     def _build_mcp_servers(self, session_id: str) -> dict[str, Any]:
@@ -1765,50 +1775,37 @@ class AgentEngine:
     async def _generate_session_title(
         self, session_id: str, first_message: str,
     ) -> None:
-        """Generate a meaningful short title for a session using Haiku."""
+        """Generate a meaningful short title for a session using a fast model."""
         try:
-            import httpx
-            api_key = self.config.effective_api_key
-            if not api_key:
+            # Skip if no credentials are configured (neither API key nor Bedrock)
+            if not self.config.provider.is_bedrock and not self.config.effective_api_key:
                 return
 
-            base_url = self.config.anthropic_api_base_url
-            async with httpx.AsyncClient() as http_client:
-                resp = await http_client.post(
-                    f"{base_url}messages",
-                    headers={
-                        "x-api-key": api_key,
-                        "anthropic-version": "2023-06-01",
-                        "content-type": "application/json",
-                    },
-                    json={
-                        "model": "claude-haiku-4-5-20251001",
-                        "max_tokens": 30,
-                        "messages": [{
-                            "role": "user",
-                            "content": (
-                                "Generate a short title (3-5 words, no quotes)"
-                                " for a conversation that starts with:\n\n"
-                                f"{first_message[:200]}"
-                            ),
-                        }],
-                    },
-                    timeout=10,
+            client = self.config.create_anthropic_client(timeout=10.0)
+            response = client.messages.create(
+                model=self.config.agent.title_model,
+                max_tokens=30,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        "Generate a short title (3-5 words, no quotes)"
+                        " for a conversation that starts with:\n\n"
+                        f"{first_message[:200]}"
+                    ),
+                }],
+            )
+            title = response.content[0].text.strip().strip('"\'').lstrip('#').strip()
+            if title and len(title) < 60:
+                await self.db.update_session_title(session_id, title)
+                await broadcaster.broadcast(session_id, {
+                    "type": "session_updated",
+                    "session_id": session_id,
+                    "title": title,
+                })
+                logger.info(
+                    "Generated title for session %s: %s",
+                    session_id, title,
                 )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    title = data["content"][0]["text"].strip().strip('"\'').lstrip('#').strip()
-                    if title and len(title) < 60:
-                        await self.db.update_session_title(session_id, title)
-                        await broadcaster.broadcast(session_id, {
-                            "type": "session_updated",
-                            "session_id": session_id,
-                            "title": title,
-                        })
-                        logger.info(
-                            "Generated title for session %s: %s",
-                            session_id, title,
-                        )
         except Exception as e:
             logger.warning("Failed to generate session title: %s", e)
 

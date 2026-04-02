@@ -290,32 +290,47 @@ class SourceRunner:
     # ------------------------------------------------------------------
 
     async def _get_condense_client(self) -> Any | None:
-        """Get or create the shared AsyncAnthropic client for condensation.
+        """Get or create the shared async Anthropic client for condensation.
 
         Returns None when proxy mode is active (uses httpx directly).
+        Supports both direct Anthropic API and AWS Bedrock providers.
         """
         if self.condense_config.get("use_proxy"):
             return None  # Proxy uses OpenAI-compatible httpx calls
         if self._condense_client is not None:
             return self._condense_client
-        api_key = self.condense_config.get("api_key")
-        if not api_key:
-            return None
+
+        provider = self.condense_config.get("provider", "anthropic")
+
         try:
             import anthropic
         except ImportError:
             logger.warning("anthropic package not available for content condensation")
             return None
-        base_url = self.condense_config.get("base_url")
-        kwargs: dict[str, Any] = {"api_key": api_key}
-        if base_url:
-            # Strip /v1/ suffix — Anthropic SDK prepends it internally,
-            # so including it here causes /v1/v1/messages (404).
-            url = base_url.rstrip("/")
-            if url.endswith("/v1"):
-                url = url[:-3]
-            kwargs["base_url"] = url
-        self._condense_client = anthropic.AsyncAnthropic(**kwargs)
+
+        if provider == "bedrock":
+            from anthropic import AsyncAnthropicBedrock
+            kwargs: dict[str, Any] = {}
+            if self.condense_config.get("aws_region"):
+                kwargs["aws_region"] = self.condense_config["aws_region"]
+            if self.condense_config.get("aws_profile"):
+                kwargs["aws_profile"] = self.condense_config["aws_profile"]
+            self._condense_client = AsyncAnthropicBedrock(**kwargs)
+        else:
+            api_key = self.condense_config.get("api_key")
+            if not api_key:
+                return None
+            kwargs = {"api_key": api_key}
+            base_url = self.condense_config.get("base_url")
+            if base_url:
+                # Strip /v1/ suffix — Anthropic SDK prepends it internally,
+                # so including it here causes /v1/v1/messages (404).
+                url = base_url.rstrip("/")
+                if url.endswith("/v1"):
+                    url = url[:-3]
+                kwargs["base_url"] = url
+            self._condense_client = anthropic.AsyncAnthropic(**kwargs)
+
         return self._condense_client
 
     async def _condense_via_proxy(

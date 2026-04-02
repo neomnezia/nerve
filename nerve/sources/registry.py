@@ -33,15 +33,24 @@ def build_source_runners(
     runners: list[SourceRunner] = []
     ttl_days = config.sync.message_ttl_days
 
-    # Build condense config from API credentials
+    # Build condense config from API credentials / provider
     condense_cfg: dict[str, Any] | None = None
-    if config.effective_api_key and config.memory.fast_model:
-        condense_cfg = {
-            "api_key": config.effective_api_key,
-            "model": config.memory.fast_model,
-            "base_url": config.anthropic_api_base_url,
-            "use_proxy": config.proxy.enabled,
-        }
+    if config.memory.fast_model:
+        if config.provider.is_bedrock:
+            condense_cfg = {
+                "provider": "bedrock",
+                "aws_region": config.provider.aws_region,
+                "aws_profile": config.provider.aws_profile,
+                "model": config.memory.fast_model,
+            }
+        elif config.effective_api_key:
+            condense_cfg = {
+                "provider": "anthropic",
+                "api_key": config.effective_api_key,
+                "model": config.memory.fast_model,
+                "base_url": config.anthropic_api_base_url,
+                "use_proxy": config.proxy.enabled,
+            }
 
     # Telegram
     tg = config.sync.telegram

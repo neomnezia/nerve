@@ -1654,19 +1654,14 @@ class MemUBridge:
             logger.warning("Event date resolution failed: %s", e)
 
     def _get_anthropic_client(self) -> Any:
-        """Get or create the shared sync Anthropic client."""
+        """Get or create the shared sync Anthropic client.
+
+        Uses the config factory method which returns AnthropicBedrock
+        when provider is "bedrock", or standard Anthropic otherwise.
+        """
         if self._anthropic_client is not None:
             return self._anthropic_client
-        import anthropic
-        base_url = self.config.anthropic_api_base_url.rstrip("/")
-        # Strip /v1/ suffix — Anthropic SDK prepends it internally.
-        if base_url.endswith("/v1"):
-            base_url = base_url[:-3]
-        self._anthropic_client = anthropic.Anthropic(
-            api_key=self.config.effective_api_key,
-            base_url=base_url,
-            timeout=60.0,
-        )
+        self._anthropic_client = self.config.create_anthropic_client(timeout=60.0)
         return self._anthropic_client
 
     def _resolve_dates_via_llm(

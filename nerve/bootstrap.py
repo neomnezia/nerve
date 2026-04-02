@@ -180,6 +180,10 @@ class SetupChoices:
     anthropic_api_key: str = ""
     openai_api_key: str = ""
     use_proxy: bool = False  # Use CLIProxyAPI instead of direct API key
+    # Provider
+    provider_type: str = "anthropic"  # "anthropic" | "bedrock"
+    aws_region: str = ""
+    aws_profile: str = ""
     workspace_path: Path = field(default_factory=lambda: Path("~/nerve-workspace"))
     timezone: str = "America/New_York"
     user_name: str = ""
@@ -725,11 +729,14 @@ class SetupWizard:
         click.echo()
         click.secho("  1) Anthropic API key  — direct access (requires sk-ant-... key)", dim=True)
         click.secho("  2) Claude Code proxy  — routes through your Claude subscription", dim=True)
+        click.secho("  3) AWS Bedrock        — uses AWS IAM credentials", dim=True)
         click.echo()
 
-        auth_mode = click.prompt("Choose", type=click.Choice(["1", "2"]), default="1")
+        auth_mode = click.prompt("Choose", type=click.Choice(["1", "2", "3"]), default="1")
 
-        if auth_mode == "2":
+        if auth_mode == "3":
+            self._step_bedrock_setup()
+        elif auth_mode == "2":
             self._step_proxy_setup()
         else:
             self._step_api_key_direct()
@@ -751,6 +758,37 @@ class SetupWizard:
                 self.choices.anthropic_api_key = key
                 break
             click.secho("  Invalid key — should start with 'sk-ant-'. Try again.", fg="yellow")
+
+    def _step_bedrock_setup(self) -> None:
+        """Configure AWS Bedrock as the provider."""
+        click.echo()
+        click.secho(
+            "AWS Bedrock routes API calls through your AWS account.\n"
+            "On EC2/ECS/EKS, IAM roles provide credentials automatically.\n"
+            "Outside AWS, configure credentials via AWS CLI or environment variables.",
+            dim=True,
+        )
+        click.echo()
+
+        self.choices.provider_type = "bedrock"
+
+        region = click.prompt("AWS Region", default="us-east-1")
+        self.choices.aws_region = region
+
+        profile = click.prompt(
+            "AWS Profile (Enter to skip — use IAM role or env vars)", default="",
+        )
+        if profile:
+            self.choices.aws_profile = profile
+
+        click.echo()
+        click.secho(
+            "  Make sure you have enabled Claude model access in the\n"
+            "  AWS Bedrock console for your region.",
+            fg="yellow",
+        )
+        click.echo()
+        click.secho("  → Bedrock provider configured.", fg="green")
 
     def _step_proxy_setup(self) -> None:
         """Set up CLIProxyAPI for Claude Code OAuth proxy."""
@@ -1192,7 +1230,9 @@ class SetupWizard:
         click.echo()
 
         ws = str(self.choices.workspace_path)
-        if self.choices.claude_oauth_token:
+        if self.choices.provider_type == "bedrock":
+            api_status = f"Bedrock ✓ ({self.choices.aws_region})"
+        elif self.choices.claude_oauth_token:
             api_status = "OAuth ✓"
         elif self.choices.use_proxy:
             api_status = "Proxy ✓"
@@ -1450,6 +1490,22 @@ class SetupWizard:
                 "github_events": {"enabled": self.choices.github_sync},
             }
 
+        # Provider configuration
+        if self.choices.provider_type == "bedrock":
+            config["provider"] = {
+                "type": "bedrock",
+                "aws_region": self.choices.aws_region,
+            }
+            if self.choices.aws_profile:
+                config["provider"]["aws_profile"] = self.choices.aws_profile
+            # Override model names to Bedrock IDs
+            config["agent"]["model"] = "us.anthropic.claude-opus-4-6-v1"
+            config["agent"]["cron_model"] = "us.anthropic.claude-sonnet-4-6"
+            config["agent"]["title_model"] = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+            config["memory"]["recall_model"] = "us.anthropic.claude-sonnet-4-6"
+            config["memory"]["memorize_model"] = "us.anthropic.claude-sonnet-4-6"
+            config["memory"]["fast_model"] = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+
         if self.choices.use_proxy:
             config["proxy"] = {
                 "enabled": True,
@@ -1645,24 +1701,37 @@ def run_non_interactive(config_dir: Path) -> SetupChoices:
     """Non-interactive setup using environment variables. For Docker."""
     choices = SetupChoices()
 
-    # API auth: OAuth token, API key, or proxy mode.
-    # Follows priority waterfall — first match wins.
-    use_proxy = os.environ.get("NERVE_USE_PROXY", "") == "1"
-    choices.use_proxy = use_proxy
-
-    claude_oauth_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-
-    if claude_oauth_token:
-        choices.claude_oauth_token = claude_oauth_token
-    if api_key:
-        choices.anthropic_api_key = api_key
-
-    if not use_proxy and not api_key and not claude_oauth_token:
-        raise click.ClickException(
-            "ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN environment variable is required "
-            "for non-interactive setup (or set NERVE_USE_PROXY=1 to use CLIProxyAPI instead)"
+    # Provider detection — check before API key requirements.
+    provider = os.environ.get("NERVE_PROVIDER", "anthropic")
+    if provider == "bedrock":
+        choices.provider_type = "bedrock"
+        choices.aws_region = os.environ.get(
+            "NERVE_AWS_REGION", os.environ.get("AWS_REGION", "us-east-1"),
         )
+        choices.aws_profile = os.environ.get(
+            "NERVE_AWS_PROFILE", os.environ.get("AWS_PROFILE", ""),
+        )
+        # Bedrock uses IAM — no Anthropic API key needed
+    else:
+        # API auth: OAuth token, API key, or proxy mode.
+        # Follows priority waterfall — first match wins.
+        use_proxy = os.environ.get("NERVE_USE_PROXY", "") == "1"
+        choices.use_proxy = use_proxy
+
+        claude_oauth_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+
+        if claude_oauth_token:
+            choices.claude_oauth_token = claude_oauth_token
+        if api_key:
+            choices.anthropic_api_key = api_key
+
+        if not use_proxy and not api_key and not claude_oauth_token:
+            raise click.ClickException(
+                "ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN environment variable is required "
+                "for non-interactive setup (or set NERVE_USE_PROXY=1 to use CLIProxyAPI, "
+                "or set NERVE_PROVIDER=bedrock for AWS Bedrock)"
+            )
 
     # GitHub token (from host extraction or env var)
     gh_token = os.environ.get("GH_TOKEN", "")

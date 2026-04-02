@@ -67,9 +67,41 @@ class GatewayConfig:
 
 
 @dataclass
+class ProviderConfig:
+    """LLM provider configuration — controls how Nerve connects to Claude.
+
+    Supported types:
+      - "anthropic" (default): Direct Anthropic API or Claude Code proxy.
+      - "bedrock": AWS Bedrock. Uses IAM role on EC2/ECS/EKS automatically;
+        outside AWS, configure credentials via AWS CLI, env vars, or explicit keys.
+    """
+
+    type: str = "anthropic"             # "anthropic" | "bedrock"
+    aws_region: str = ""                # Bedrock region (falls back to us-east-1)
+    aws_profile: str = ""               # AWS SSO profile name (optional)
+    aws_access_key_id: str = ""         # Explicit creds (optional — IAM role preferred)
+    aws_secret_access_key: str = ""     # Explicit creds (optional)
+
+    @property
+    def is_bedrock(self) -> bool:
+        return self.type == "bedrock"
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ProviderConfig:
+        return cls(
+            type=d.get("type", "anthropic"),
+            aws_region=d.get("aws_region", ""),
+            aws_profile=d.get("aws_profile", ""),
+            aws_access_key_id=d.get("aws_access_key_id", ""),
+            aws_secret_access_key=d.get("aws_secret_access_key", ""),
+        )
+
+
+@dataclass
 class AgentConfig:
     model: str = "claude-opus-4-6"
     cron_model: str = "claude-sonnet-4-6"
+    title_model: str = "claude-haiku-4-5-20251001"  # Session title generation
     max_turns: int = 100
     max_concurrent: int = 4
     thinking: str = "max"       # max, high, medium, low, disabled, adaptive, or number (budget_tokens)
@@ -81,6 +113,7 @@ class AgentConfig:
         return cls(
             model=d.get("model", "claude-opus-4-6"),
             cron_model=d.get("cron_model", "claude-sonnet-4-6"),
+            title_model=d.get("title_model", "claude-haiku-4-5-20251001"),
             max_turns=d.get("max_turns", 100),
             max_concurrent=d.get("max_concurrent", 4),
             thinking=str(d.get("thinking", "max")),
@@ -558,6 +591,7 @@ class NerveConfig:
     deployment: str = "server"            # "server" or "docker"
     quiet_start: str = "02:00"            # HH:MM — start of quiet period (local timezone)
     quiet_end: str = "08:00"              # HH:MM — end of quiet period (local timezone)
+    provider: ProviderConfig = field(default_factory=ProviderConfig)
     gateway: GatewayConfig = field(default_factory=GatewayConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
@@ -581,6 +615,8 @@ class NerveConfig:
     @property
     def anthropic_api_base_url(self) -> str:
         """Effective Anthropic API base URL — proxy or direct."""
+        if self.provider.is_bedrock:
+            return ""  # Bedrock doesn't use Anthropic base URL
         if self.proxy.enabled:
             return f"http://{self.proxy.host}:{self.proxy.port}/v1/"
         return "https://api.anthropic.com/v1/"
@@ -588,9 +624,70 @@ class NerveConfig:
     @property
     def effective_api_key(self) -> str:
         """Effective API key — proxy's local key or real Anthropic key."""
+        if self.provider.is_bedrock:
+            return ""  # Bedrock uses IAM, not API keys
         if self.proxy.enabled:
             return self.proxy.api_key
         return self.anthropic_api_key
+
+    def create_anthropic_client(self, timeout: float = 60.0) -> Any:
+        """Create an Anthropic client based on the configured provider.
+
+        Returns AnthropicBedrock when provider is "bedrock", otherwise
+        a standard Anthropic client using the effective API key and base URL.
+        """
+        import anthropic
+
+        if self.provider.is_bedrock:
+            from anthropic import AnthropicBedrock
+            kwargs: dict[str, Any] = {"timeout": timeout}
+            if self.provider.aws_region:
+                kwargs["aws_region"] = self.provider.aws_region
+            if self.provider.aws_profile:
+                kwargs["aws_profile"] = self.provider.aws_profile
+            if self.provider.aws_access_key_id:
+                kwargs["aws_access_key"] = self.provider.aws_access_key_id
+                kwargs["aws_secret_key"] = self.provider.aws_secret_access_key
+            return AnthropicBedrock(**kwargs)
+
+        # Default: direct Anthropic API (or proxy)
+        base_url = self.anthropic_api_base_url.rstrip("/")
+        if base_url.endswith("/v1"):
+            base_url = base_url[:-3]
+        return anthropic.Anthropic(
+            api_key=self.effective_api_key,
+            base_url=base_url,
+            timeout=timeout,
+        )
+
+    def create_async_anthropic_client(self, timeout: float = 60.0) -> Any:
+        """Create an async Anthropic client based on the configured provider.
+
+        Returns AsyncAnthropicBedrock when provider is "bedrock", otherwise
+        a standard AsyncAnthropic client.
+        """
+        import anthropic
+
+        if self.provider.is_bedrock:
+            from anthropic import AsyncAnthropicBedrock
+            kwargs: dict[str, Any] = {"timeout": timeout}
+            if self.provider.aws_region:
+                kwargs["aws_region"] = self.provider.aws_region
+            if self.provider.aws_profile:
+                kwargs["aws_profile"] = self.provider.aws_profile
+            if self.provider.aws_access_key_id:
+                kwargs["aws_access_key"] = self.provider.aws_access_key_id
+                kwargs["aws_secret_key"] = self.provider.aws_secret_access_key
+            return AsyncAnthropicBedrock(**kwargs)
+
+        base_url = self.anthropic_api_base_url.rstrip("/")
+        if base_url.endswith("/v1"):
+            base_url = base_url[:-3]
+        return anthropic.AsyncAnthropic(
+            api_key=self.effective_api_key,
+            base_url=base_url,
+            timeout=timeout,
+        )
 
     @classmethod
     def from_dict(cls, d: dict) -> NerveConfig:
@@ -600,6 +697,7 @@ class NerveConfig:
             deployment=d.get("deployment", "server"),
             quiet_start=d.get("quiet_start", "02:00"),
             quiet_end=d.get("quiet_end", "08:00"),
+            provider=ProviderConfig.from_dict(d.get("provider", {})),
             gateway=GatewayConfig.from_dict(d.get("gateway", {})),
             agent=AgentConfig.from_dict(d.get("agent", {})),
             telegram=TelegramConfig.from_dict(d.get("telegram", {})),
