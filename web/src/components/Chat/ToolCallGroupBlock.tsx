@@ -39,22 +39,22 @@ export function ToolCallGroupBlock({ group }: { group: ToolCallGroup }) {
         <button
           onClick={() => setExpanded(!expanded)}
           className="flex items-center gap-2 w-full px-3 py-1.5 text-left cursor-pointer
-                     text-[12px] text-[#555] hover:text-[#888] hover:bg-[#1a1a1a]
+                     text-[12px] text-text-faint hover:text-text-muted hover:bg-surface-raised
                      rounded-md transition-colors"
         >
           {hasRunning
             ? <Loader2 size={12} className="text-[#6366f1] animate-spin shrink-0" />
-            : <Icon size={12} className={`shrink-0 ${hasError ? 'text-red-400' : 'text-[#555]'}`} />
+            : <Icon size={12} className={`shrink-0 ${hasError ? 'text-red-400' : 'text-text-faint'}`} />
           }
           <span className="font-mono font-medium">
             {expanded ? 'Collapse' : `Show ${hiddenCount} more`}
           </span>
-          <span className="text-[#444]">·</span>
-          <span className="text-[#444]">{total} {tool} calls</span>
+          <span className="text-text-faint">·</span>
+          <span className="text-text-faint">{total} {tool} calls</span>
           <div className="ml-auto shrink-0">
             {expanded
-              ? <ChevronDown size={12} className="text-[#444]" />
-              : <ChevronRight size={12} className="text-[#444]" />
+              ? <ChevronDown size={12} className="text-text-faint" />
+              : <ChevronRight size={12} className="text-text-faint" />
             }
           </div>
         </button>

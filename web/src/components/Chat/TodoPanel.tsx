@@ -38,11 +38,11 @@ export function TodoPanel({ todos }: { todos: TodoItem[] }) {
   if (todos.length === 0 || !visible) return null;
 
   return (
-    <div className={`border-t border-[#222] bg-[#0a0a0a] shrink-0 transition-all duration-300 ${allDone ? 'opacity-60' : ''}`}>
+    <div className={`border-t border-border-subtle bg-bg-sunken shrink-0 transition-all duration-300 ${allDone ? 'opacity-60' : ''}`}>
       <div className="max-w-3xl mx-auto px-5 py-2.5">
         <div className="flex items-center gap-2 mb-1.5">
-          <span className="text-[11px] font-medium text-[#555] uppercase tracking-wider">Tasks</span>
-          <span className="text-[10px] text-[#444]">
+          <span className="text-[11px] font-medium text-text-faint uppercase tracking-wider">Tasks</span>
+          <span className="text-[10px] text-text-faint">
             {todos.filter(t => t.status === 'completed').length}/{todos.length}
           </span>
         </div>
@@ -67,9 +67,9 @@ function TodoRow({ todo }: { todo: TodoItem }) {
       ) : isActive ? (
         <Loader2 size={14} className="text-[#6366f1] shrink-0 animate-spin" />
       ) : (
-        <Circle size={14} className="text-[#444] shrink-0" />
+        <Circle size={14} className="text-text-faint shrink-0" />
       )}
-      <span className={`${isCompleted ? 'line-through text-[#555]' : isActive ? 'text-[#e0e0e0]' : 'text-[#777]'} transition-colors duration-300`}>
+      <span className={`${isCompleted ? 'line-through text-text-faint' : isActive ? 'text-text' : 'text-text-muted'} transition-colors duration-300`}>
         {isActive ? todo.activeForm : todo.content}
       </span>
     </div>

@@ -32,10 +32,10 @@ export function ContextBar({ usage }: { usage: ContextUsage }) {
       onMouseEnter={() => setHovering(true)}
       onMouseLeave={() => setHovering(false)}
     >
-      <span className="text-[11px] text-[#666] whitespace-nowrap">
+      <span className="text-[11px] text-text-dim whitespace-nowrap">
         {formatTokens(used)} / {formatTokens(max)}
       </span>
-      <div className="w-20 h-1.5 bg-[#222] rounded-full overflow-hidden">
+      <div className="w-20 h-1.5 bg-border-subtle rounded-full overflow-hidden">
         <div
           className="h-full rounded-full transition-all duration-300"
           style={{ width: `${pct}%`, backgroundColor: barColor }}
@@ -43,8 +43,8 @@ export function ContextBar({ usage }: { usage: ContextUsage }) {
       </div>
 
       {hovering && (
-        <div className="absolute right-0 top-full mt-2 z-50 bg-[#1a1a1a] border border-[#333] rounded-lg p-3 shadow-xl min-w-[220px]">
-          <div className="text-[11px] text-[#888] uppercase tracking-wider mb-2">Context Usage</div>
+        <div className="absolute right-0 top-full mt-2 z-50 bg-surface-raised border border-border-subtle rounded-lg p-3 shadow-xl min-w-[220px]">
+          <div className="text-[11px] text-text-muted uppercase tracking-wider mb-2">Context Usage</div>
           <div className="space-y-1.5 text-[12px]">
             <Row label="Input tokens" value={usage.input_tokens} />
             <Row label="Output tokens" value={usage.output_tokens} />
@@ -54,7 +54,7 @@ export function ContextBar({ usage }: { usage: ContextUsage }) {
             {usage.cache_creation_input_tokens > 0 && (
               <Row label="Cache created" value={usage.cache_creation_input_tokens} color="#a855f7" />
             )}
-            <div className="border-t border-[#333] my-1.5" />
+            <div className="border-t border-border-subtle my-1.5" />
             <Row label="Total used" value={used} bold />
             <Row label="Max context" value={max} />
             <Row label="Remaining" value={max - used} color={pct > 80 ? '#ef4444' : '#22c55e'} />
@@ -68,7 +68,7 @@ export function ContextBar({ usage }: { usage: ContextUsage }) {
 function Row({ label, value, color, bold }: { label: string; value: number; color?: string; bold?: boolean }) {
   return (
     <div className="flex justify-between items-center">
-      <span className="text-[#888]">{label}</span>
+      <span className="text-text-muted">{label}</span>
       <span className={bold ? 'text-[#ddd] font-medium' : 'text-[#aaa]'} style={color ? { color } : undefined}>
         {formatTokens(value)}
       </span>

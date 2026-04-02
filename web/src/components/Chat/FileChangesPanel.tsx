@@ -38,13 +38,13 @@ function splitPath(shortPath: string): { fileName: string; dirPath: string } {
 function FileCard({ file, onClick }: { file: ModifiedFileSummary; onClick: () => void }) {
   const { fileName, dirPath } = splitPath(file.short_path);
   const Icon = STATUS_ICON[file.status] || FileEdit;
-  const color = STATUS_COLOR[file.status] || 'text-[#888]';
+  const color = STATUS_COLOR[file.status] || 'text-text-muted';
   const badge = STATUS_BADGE[file.status] || '?';
 
   return (
     <button
       onClick={onClick}
-      className="w-full text-left px-4 py-2.5 hover:bg-[#151515] transition-colors cursor-pointer border-b border-[#1a1a1a] last:border-b-0 group"
+      className="w-full text-left px-4 py-2.5 hover:bg-surface transition-colors cursor-pointer border-b border-surface-raised last:border-b-0 group"
     >
       <div className="flex items-center gap-2.5">
         <span className={`text-[11px] font-bold font-mono w-4 text-center shrink-0 ${color}`}>
@@ -53,10 +53,10 @@ function FileCard({ file, onClick }: { file: ModifiedFileSummary; onClick: () =>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
             <Icon size={13} className={`shrink-0 ${color}`} />
-            <span className="text-[13px] font-medium text-[#ccc] truncate">{fileName}</span>
+            <span className="text-[13px] font-medium text-text-secondary truncate">{fileName}</span>
           </div>
           {dirPath && (
-            <div className="text-[11px] text-[#555] truncate ml-[21px]">{dirPath}</div>
+            <div className="text-[11px] text-text-faint truncate ml-[21px]">{dirPath}</div>
           )}
         </div>
         <div className="flex items-center gap-1.5 shrink-0 text-[11px] font-mono tabular-nums">
@@ -95,15 +95,15 @@ function FileDetailView({ file, onBack }: { file: ModifiedFileSummary; onBack: (
   }, [activeSession, file.path]);
 
   const { fileName } = splitPath(file.short_path);
-  const color = STATUS_COLOR[file.status] || 'text-[#888]';
+  const color = STATUS_COLOR[file.status] || 'text-text-muted';
 
   return (
     <div className="flex flex-col h-full">
       {/* Detail header */}
-      <div className="flex items-center gap-2 px-4 py-2.5 border-b border-[#222] bg-[#0a0a0a] shrink-0">
+      <div className="flex items-center gap-2 px-4 py-2.5 border-b border-border-subtle bg-bg-sunken shrink-0">
         <button
           onClick={onBack}
-          className="w-5 h-5 flex items-center justify-center text-[#555] hover:text-[#999] cursor-pointer transition-colors"
+          className="w-5 h-5 flex items-center justify-center text-text-faint hover:text-text-muted cursor-pointer transition-colors"
         >
           <ArrowLeft size={14} />
         </button>
@@ -117,7 +117,7 @@ function FileDetailView({ file, onBack }: { file: ModifiedFileSummary; onBack: (
           )}
         </div>
       </div>
-      <div className="text-[11px] text-[#555] px-4 py-1 bg-[#0a0a0a] border-b border-[#1a1a1a]">
+      <div className="text-[11px] text-text-faint px-4 py-1 bg-bg-sunken border-b border-surface-raised">
         {file.short_path}
       </div>
 
@@ -125,7 +125,7 @@ function FileDetailView({ file, onBack }: { file: ModifiedFileSummary; onBack: (
       <div ref={containerRef} className="flex-1 overflow-y-auto relative" data-role="plan">
         <SelectionToolbar containerRef={containerRef} />
         {loading && (
-          <div className="flex items-center gap-2 justify-center py-8 text-[13px] text-[#555]">
+          <div className="flex items-center gap-2 justify-center py-8 text-[13px] text-text-faint">
             <Loader2 size={14} className="animate-spin" /> Loading diff...
           </div>
         )}
@@ -175,15 +175,15 @@ export function FileChangesPanel() {
   return (
     <div className="flex flex-col h-full">
       {/* List header */}
-      <div className="flex items-center justify-between px-4 py-2 border-b border-[#222] bg-[#0a0a0a] shrink-0">
-        <div className="flex items-center gap-2 text-[12px] text-[#888]">
+      <div className="flex items-center justify-between px-4 py-2 border-b border-border-subtle bg-bg-sunken shrink-0">
+        <div className="flex items-center gap-2 text-[12px] text-text-muted">
           <span>{modifiedFiles.length} file{modifiedFiles.length !== 1 ? 's' : ''}</span>
           {totalAdd > 0 && <span className="text-green-400 font-mono">+{totalAdd}</span>}
           {totalDel > 0 && <span className="text-red-400 font-mono">&minus;{totalDel}</span>}
         </div>
         <button
           onClick={handleRefresh}
-          className="w-5 h-5 flex items-center justify-center text-[#444] hover:text-[#888] cursor-pointer transition-colors"
+          className="w-5 h-5 flex items-center justify-center text-text-faint hover:text-text-muted cursor-pointer transition-colors"
           title="Refresh file list"
         >
           <RefreshCw size={12} className={refreshing ? 'animate-spin' : ''} />
@@ -193,7 +193,7 @@ export function FileChangesPanel() {
       {/* File list */}
       <div className="flex-1 overflow-y-auto">
         {modifiedFiles.length === 0 ? (
-          <div className="px-4 py-8 text-center text-[13px] text-[#444]">
+          <div className="px-4 py-8 text-center text-[13px] text-text-faint">
             No files modified in this session
           </div>
         ) : (

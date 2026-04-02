@@ -19,7 +19,7 @@ function toolIcon(tool: string) {
 
 const STATUS_COLORS = {
   running: 'text-emerald-400',
-  done: 'text-[#555]',
+  done: 'text-text-faint',
   timeout: 'text-amber-400',
 } as const;
 
@@ -57,7 +57,7 @@ export function BackgroundJobs({ sessions, activeSession, onSelect }: {
       <div className={`flex items-center gap-1.5 px-2 py-1 rounded text-[12px] cursor-default ${
         runningTasks.length > 0
           ? 'text-emerald-400 bg-emerald-400/10'
-          : 'text-[#555] bg-[#1a1a1a]'
+          : 'text-text-faint bg-surface-raised'
       }`}>
         {runningTasks.length > 0 ? (
           <span className="relative flex h-2 w-2 shrink-0">
@@ -74,7 +74,7 @@ export function BackgroundJobs({ sessions, activeSession, onSelect }: {
           }
         </span>
         {runningSessions.length > 0 && (
-          <span className="text-[#555]">
+          <span className="text-text-faint">
             + {runningSessions.length} session{runningSessions.length > 1 ? 's' : ''}
           </span>
         )}
@@ -82,11 +82,11 @@ export function BackgroundJobs({ sessions, activeSession, onSelect }: {
 
       {/* Dropdown */}
       {hovering && (
-        <div className="absolute right-0 top-full mt-1.5 z-50 bg-[#1a1a1a] border border-[#333] rounded-lg shadow-xl min-w-[280px] max-w-[380px] py-1">
+        <div className="absolute right-0 top-full mt-1.5 z-50 bg-surface-raised border border-border-subtle rounded-lg shadow-xl min-w-[280px] max-w-[380px] py-1">
           {/* Background tasks (current session) */}
           {backgroundTasks.length > 0 && (
             <>
-              <div className="px-3 py-1.5 text-[10px] text-[#555] uppercase tracking-wider">
+              <div className="px-3 py-1.5 text-[10px] text-text-faint uppercase tracking-wider">
                 Background Tasks
               </div>
               {backgroundTasks.map(task => {
@@ -107,7 +107,7 @@ export function BackgroundJobs({ sessions, activeSession, onSelect }: {
                     <span className={`flex-1 min-w-0 truncate ${statusColor}`}>
                       {task.label}
                     </span>
-                    <span className="shrink-0 text-[10px] text-[#444] flex items-center gap-1">
+                    <span className="shrink-0 text-[10px] text-text-faint flex items-center gap-1">
                       <Icon size={10} />
                       {task.status === 'running' ? formatElapsed(task.startedAt) : task.status}
                     </span>
@@ -120,19 +120,19 @@ export function BackgroundJobs({ sessions, activeSession, onSelect }: {
           {/* Running sessions (other sessions) */}
           {runningSessions.length > 0 && (
             <>
-              {backgroundTasks.length > 0 && <div className="border-t border-[#2a2a2a] my-1" />}
-              <div className="px-3 py-1.5 text-[10px] text-[#555] uppercase tracking-wider">
+              {backgroundTasks.length > 0 && <div className="border-t border-border my-1" />}
+              <div className="px-3 py-1.5 text-[10px] text-text-faint uppercase tracking-wider">
                 Other Running Sessions
               </div>
               {runningSessions.map(s => (
                 <button
                   key={s.id}
                   onClick={() => { setHovering(false); onSelect(s.id); }}
-                  className="w-full flex items-center gap-2 px-3 py-1.5 text-left text-[12px] text-[#aaa] hover:bg-[#222] hover:text-[#ddd] transition-colors cursor-pointer"
+                  className="w-full flex items-center gap-2 px-3 py-1.5 text-left text-[12px] text-[#aaa] hover:bg-border-subtle hover:text-[#ddd] transition-colors cursor-pointer"
                 >
                   <Loader2 size={12} className="shrink-0 text-emerald-400 animate-spin" />
                   <span className="flex-1 min-w-0 truncate">{s.title || s.id}</span>
-                  <span className="shrink-0 text-[10px] text-[#555]">
+                  <span className="shrink-0 text-[10px] text-text-faint">
                     {s.source || 'web'}
                   </span>
                 </button>

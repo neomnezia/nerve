@@ -120,13 +120,13 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
   }, [runningSystemCount]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
-    <div className={`bg-[#141414] border-r border-[#222] flex flex-col shrink-0 transition-all duration-200 overflow-hidden ${collapsed ? 'w-0 border-r-0' : 'w-60'}`}>
+    <div className={`bg-surface border-r border-border-subtle flex flex-col shrink-0 transition-all duration-200 overflow-hidden ${collapsed ? 'w-0 border-r-0' : 'w-60'}`}>
       {/* Header */}
-      <div className="flex items-center justify-between px-3 py-2.5 border-b border-[#222]">
-        <span className="text-[10px] uppercase tracking-wider text-[#444] font-medium">Conversations</span>
+      <div className="flex items-center justify-between px-3 py-2.5 border-b border-border-subtle">
+        <span className="text-[10px] uppercase tracking-wider text-text-faint font-medium">Conversations</span>
         <button
           onClick={onCreate}
-          className="w-5 h-5 rounded flex items-center justify-center text-[#555] hover:text-[#aaa] hover:bg-[#1f1f1f] cursor-pointer"
+          className="w-5 h-5 rounded flex items-center justify-center text-text-faint hover:text-[#aaa] hover:bg-surface-hover cursor-pointer"
           title="New session"
         >
           <Plus size={12} />
@@ -136,19 +136,19 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
       {/* Search */}
       <div className="px-2 py-1.5">
         <div className="relative">
-          <Search size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-[#444]" />
+          <Search size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-text-faint" />
           <input
             ref={inputRef}
             type="text"
             value={localQuery}
             onChange={e => handleSearchChange(e.target.value)}
             placeholder="Search sessions..."
-            className="w-full bg-[#1a1a1a] border border-[#2a2a2a] rounded-md text-[12px] text-[#ccc] placeholder-[#444] pl-7 pr-7 py-1.5 outline-none focus:border-[#444] transition-colors"
+            className="w-full bg-surface-raised border border-border rounded-md text-[12px] text-text-secondary placeholder-text-faint pl-7 pr-7 py-1.5 outline-none focus:border-text-faint transition-colors"
           />
           {isSearching && (
             <button
               onClick={() => { setLocalQuery(''); clearSearch(); }}
-              className="absolute right-1.5 top-1/2 -translate-y-1/2 p-0.5 text-[#444] hover:text-[#888] cursor-pointer"
+              className="absolute right-1.5 top-1/2 -translate-y-1/2 p-0.5 text-text-faint hover:text-text-muted cursor-pointer"
             >
               <X size={12} />
             </button>
@@ -161,19 +161,19 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
         {isSearching ? (
           <div>
             {searchLoading && !searchResults && (
-              <div className="flex items-center gap-2 px-3 py-3 text-[11px] text-[#555]">
+              <div className="flex items-center gap-2 px-3 py-3 text-[11px] text-text-faint">
                 <Loader2 size={11} className="animate-spin" />
                 Searching...
               </div>
             )}
             {searchResults && (
               <>
-                <div className="px-3 py-1.5 text-[10px] text-[#444]">
+                <div className="px-3 py-1.5 text-[10px] text-text-faint">
                   {searchResults.length} result{searchResults.length !== 1 ? 's' : ''}
                   {searchLoading && <Loader2 size={9} className="inline ml-1.5 animate-spin" />}
                 </div>
                 {searchResults.length === 0 ? (
-                  <div className="px-3 py-2 text-[11px] text-[#444]">No matching sessions</div>
+                  <div className="px-3 py-2 text-[11px] text-text-faint">No matching sessions</div>
                 ) : (
                   searchResults.map((s) => (
                     <SessionItem
@@ -238,13 +238,13 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
 
             {/* Normal date-grouped view */}
             {groupedConversations.length === 0 && pinnedRunning.length === 0 && pinnedStarred.length === 0 && (
-              <div className="px-3 py-2 text-[11px] text-[#444]">No conversations yet</div>
+              <div className="px-3 py-2 text-[11px] text-text-faint">No conversations yet</div>
             )}
 
             {groupedConversations.map(({ group, items }) => (
               <div key={group}>
                 <div className="px-3 pt-2.5 pb-0.5">
-                  <span className="text-[10px] text-[#3a3a3a] font-medium">{group}</span>
+                  <span className="text-[10px] text-text-faint font-medium">{group}</span>
                 </div>
                 {items.map((s) => (
                   <SessionItem
@@ -263,17 +263,17 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
 
             {/* System sessions */}
             {systemSessions.length > 0 && (
-              <div className="mt-2 border-t border-[#1e1e1e] pt-1">
+              <div className="mt-2 border-t border-border-subtle pt-1">
                 <button
                   onClick={() => setSystemExpanded(!systemExpanded)}
-                  className="flex items-center gap-1.5 px-3 py-1.5 w-full text-left cursor-pointer hover:bg-[#1a1a1a] transition-colors"
+                  className="flex items-center gap-1.5 px-3 py-1.5 w-full text-left cursor-pointer hover:bg-surface-raised transition-colors"
                 >
                   {systemExpanded
-                    ? <ChevronDown size={10} className="text-[#444]" />
-                    : <ChevronRight size={10} className="text-[#444]" />
+                    ? <ChevronDown size={10} className="text-text-faint" />
+                    : <ChevronRight size={10} className="text-text-faint" />
                   }
-                  <Bot size={10} className="text-[#444]" />
-                  <span className="text-[10px] uppercase tracking-wider text-[#444] font-medium">
+                  <Bot size={10} className="text-text-faint" />
+                  <span className="text-[10px] uppercase tracking-wider text-text-faint font-medium">
                     System ({systemSessions.length})
                   </span>
                   {runningSystemCount > 0 && (
@@ -293,8 +293,8 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onSelect,
                     onClick={() => onSelect(s.id)}
                     className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md cursor-pointer text-[12px] transition-colors
                       ${s.id === activeSession
-                        ? 'bg-[#1f1f2f] text-[#999]'
-                        : 'text-[#555] hover:bg-[#1a1a1a] hover:text-[#777]'
+                        ? 'bg-[#1f1f2f] text-text-muted'
+                        : 'text-text-faint hover:bg-surface-raised hover:text-text-muted'
                       }`}
                   >
                     <Bot size={11} className="shrink-0" />
@@ -397,7 +397,7 @@ function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRenam
 
   if (renaming) {
     return (
-      <div className="flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md bg-[#1a1a1a]">
+      <div className="flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md bg-surface-raised">
         <MessageSquare size={13} className="shrink-0 opacity-50" />
         <input
           ref={inputRef}
@@ -408,7 +408,7 @@ function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRenam
             if (e.key === 'Escape') setRenaming(false);
           }}
           onBlur={handleRenameSubmit}
-          className="flex-1 min-w-0 bg-transparent text-[13px] text-[#e0e0e0] outline-none border-b border-[#444]"
+          className="flex-1 min-w-0 bg-transparent text-[13px] text-text outline-none border-b border-text-faint"
         />
       </div>
     );
@@ -419,8 +419,8 @@ function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRenam
       onClick={() => onSelect(session.id)}
       className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md cursor-pointer text-sm transition-colors
         ${isActive
-          ? 'bg-[#1f1f2f] text-[#e0e0e0]'
-          : 'text-[#888] hover:bg-[#1a1a1a] hover:text-[#bbb]'
+          ? 'bg-[#1f1f2f] text-text'
+          : 'text-text-muted hover:bg-surface-raised hover:text-[#bbb]'
         }`}
     >
       {isImplementSession(session)
@@ -436,7 +436,7 @@ function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRenam
 
       {/* Date label in search results */}
       {showDate && !isRunning && (
-        <span className="shrink-0 text-[10px] text-[#3a3a3a] tabular-nums">
+        <span className="shrink-0 text-[10px] text-text-faint tabular-nums">
           {formatShortDate(session.updated_at)}
         </span>
       )}
@@ -447,8 +447,8 @@ function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRenam
           onClick={(e) => { e.stopPropagation(); setMenuOpen(!menuOpen); }}
           className={`p-0.5 cursor-pointer transition-opacity ${
             session.starred
-              ? 'text-yellow-500 opacity-100 [&>*:first-child]:block [&>*:last-child]:hidden hover:[&>*:first-child]:hidden hover:[&>*:last-child]:block hover:text-[#888]'
-              : 'text-[#333] opacity-0 group-hover:opacity-100 hover:text-[#888]'
+              ? 'text-yellow-500 opacity-100 [&>*:first-child]:block [&>*:last-child]:hidden hover:[&>*:first-child]:hidden hover:[&>*:last-child]:block hover:text-text-muted'
+              : 'text-border-subtle opacity-0 group-hover:opacity-100 hover:text-text-muted'
           }`}
         >
           {session.starred ? (
@@ -462,14 +462,14 @@ function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRenam
         </button>
 
         {menuOpen && (
-          <div className="absolute right-0 top-full mt-1 z-50 bg-[#1a1a1a] border border-[#333] rounded-lg shadow-xl py-1 min-w-[140px]">
+          <div className="absolute right-0 top-full mt-1 z-50 bg-surface-raised border border-border-subtle rounded-lg shadow-xl py-1 min-w-[140px]">
             <button
               onClick={(e) => {
                 e.stopPropagation();
                 onToggleStar(session.id);
                 setMenuOpen(false);
               }}
-              className="flex items-center gap-2.5 w-full px-3 py-1.5 text-[13px] text-[#ccc] hover:bg-[#222] cursor-pointer transition-colors"
+              className="flex items-center gap-2.5 w-full px-3 py-1.5 text-[13px] text-text-secondary hover:bg-border-subtle cursor-pointer transition-colors"
             >
               <Star size={14} className={session.starred ? 'text-yellow-500 fill-yellow-500' : ''} />
               {session.starred ? 'Unstar' : 'Star'}
@@ -481,19 +481,19 @@ function SessionItem({ session, isActive, isRunning, onSelect, onDelete, onRenam
                 setRenaming(true);
                 setMenuOpen(false);
               }}
-              className="flex items-center gap-2.5 w-full px-3 py-1.5 text-[13px] text-[#ccc] hover:bg-[#222] cursor-pointer transition-colors"
+              className="flex items-center gap-2.5 w-full px-3 py-1.5 text-[13px] text-text-secondary hover:bg-border-subtle cursor-pointer transition-colors"
             >
               <Pencil size={14} />
               Rename
             </button>
-            <div className="border-t border-[#2a2a2a] my-1" />
+            <div className="border-t border-border my-1" />
             <button
               onClick={(e) => {
                 e.stopPropagation();
                 setMenuOpen(false);
                 onDelete(session.id);
               }}
-              className="flex items-center gap-2.5 w-full px-3 py-1.5 text-[13px] text-red-400 hover:bg-[#222] cursor-pointer transition-colors"
+              className="flex items-center gap-2.5 w-full px-3 py-1.5 text-[13px] text-red-400 hover:bg-border-subtle cursor-pointer transition-colors"
             >
               <Trash2 size={14} />
               Delete

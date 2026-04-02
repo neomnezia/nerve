@@ -84,46 +84,46 @@ function GenericToolBlock({ block }: { block: ToolCallBlockData }) {
   const isRunning = block.status === 'running';
 
   return (
-    <div className="my-1.5 border border-[#2a2a2a] rounded-lg bg-[#141414] overflow-hidden">
+    <div className="my-1.5 border border-border rounded-lg bg-surface overflow-hidden">
       <button
         onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-2 w-full px-3 py-2 text-left cursor-pointer hover:bg-[#1a1a1a] transition-colors"
+        className="flex items-center gap-2 w-full px-3 py-2 text-left cursor-pointer hover:bg-surface-raised transition-colors"
       >
         {isRunning
           ? <Loader2 size={14} className="text-[#6366f1] animate-spin shrink-0" />
-          : <Icon size={14} className={`shrink-0 ${block.isError ? 'text-red-400' : 'text-[#888]'}`} />
+          : <Icon size={14} className={`shrink-0 ${block.isError ? 'text-red-400' : 'text-text-muted'}`} />
         }
-        <span className="text-[13px] font-mono font-medium text-[#ccc]">{block.tool}</span>
-        {summary && <span className="text-[12px] text-[#666] truncate font-mono">{summary}</span>}
+        <span className="text-[13px] font-mono font-medium text-text-secondary">{block.tool}</span>
+        {summary && <span className="text-[12px] text-text-dim truncate font-mono">{summary}</span>}
         <div className="ml-auto shrink-0">
-          {expanded ? <ChevronDown size={14} className="text-[#555]" /> : <ChevronRight size={14} className="text-[#555]" />}
+          {expanded ? <ChevronDown size={14} className="text-text-faint" /> : <ChevronRight size={14} className="text-text-faint" />}
         </div>
       </button>
 
       {expanded && (
-        <div className="border-t border-[#2a2a2a]">
+        <div className="border-t border-border">
           {/* Input */}
           <div className="px-3 py-2">
-            <div className="text-[10px] uppercase tracking-wider text-[#555] mb-1">Input</div>
-            <pre className="text-[12px] text-[#999] font-mono whitespace-pre-wrap overflow-x-auto max-h-60 overflow-y-auto bg-[#0f0f0f] rounded p-2 border border-[#222]">
+            <div className="text-[10px] uppercase tracking-wider text-text-faint mb-1">Input</div>
+            <pre className="text-[12px] text-text-muted font-mono whitespace-pre-wrap overflow-x-auto max-h-60 overflow-y-auto bg-bg rounded p-2 border border-border-subtle">
               {JSON.stringify(block.input, null, 2)}
             </pre>
           </div>
 
           {/* Result */}
           {block.result !== undefined && (
-            <div className="px-3 py-2 border-t border-[#222]">
-              <div className="text-[10px] uppercase tracking-wider text-[#555] mb-1">
+            <div className="px-3 py-2 border-t border-border-subtle">
+              <div className="text-[10px] uppercase tracking-wider text-text-faint mb-1">
                 {block.isError ? 'Error' : 'Result'}
               </div>
-              <pre className={`text-[12px] font-mono whitespace-pre-wrap overflow-x-auto max-h-80 overflow-y-auto bg-[#0f0f0f] rounded p-2 border border-[#222] ${block.isError ? 'text-red-400' : 'text-[#999]'}`}>
+              <pre className={`text-[12px] font-mono whitespace-pre-wrap overflow-x-auto max-h-80 overflow-y-auto bg-bg rounded p-2 border border-border-subtle ${block.isError ? 'text-red-400' : 'text-text-muted'}`}>
                 {block.result}
               </pre>
             </div>
           )}
 
           {isRunning && block.result === undefined && (
-            <div className="px-3 py-3 text-[12px] text-[#666] flex items-center gap-2 border-t border-[#222]">
+            <div className="px-3 py-3 text-[12px] text-text-dim flex items-center gap-2 border-t border-border-subtle">
               <Loader2 size={12} className="animate-spin" /> Running...
             </div>
           )}
