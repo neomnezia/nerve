@@ -12,7 +12,7 @@ export function BashToolBlock({ block }: { block: ToolCallBlockData }) {
     <div className="my-1.5 border border-border rounded-lg bg-bg-sunken overflow-hidden">
       <button
         onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-2 w-full px-3 py-2 text-left cursor-pointer hover:bg-[#111] transition-colors"
+        className="flex items-center gap-2 w-full px-3 py-2 text-left cursor-pointer hover:bg-surface-hover transition-colors"
       >
         {isRunning
           ? <Loader2 size={14} className="text-[#6366f1] animate-spin shrink-0" />

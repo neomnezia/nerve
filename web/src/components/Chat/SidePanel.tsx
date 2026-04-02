@@ -63,7 +63,7 @@ function TabBar({ panels, activeId, onFocus, onClose }: {
             key={tab.id}
             onClick={() => onFocus(tab.id)}
             className={`group flex items-center gap-1.5 px-3 py-2 text-[12px] border-r border-surface-raised shrink-0 transition-colors cursor-pointer ${
-              isActive ? 'bg-bg-sunken text-text-secondary' : 'text-text-dim hover:text-text-muted hover:bg-[#111]'
+              isActive ? 'bg-bg-sunken text-text-secondary' : 'text-text-dim hover:text-text-muted hover:bg-surface-hover'
             }`}
           >
             {tab.status === 'running'
@@ -233,7 +233,7 @@ function PlanActions({ tab }: { tab: PanelTab }) {
       {isPlanExit && (
         <button
           onClick={handleDecline}
-          className="flex items-center gap-1.5 px-3 py-1 bg-[#1a1a22] hover:bg-[#252530] text-text-muted text-[12px] font-medium rounded-md cursor-pointer transition-colors"
+          className="flex items-center gap-1.5 px-3 py-1 bg-surface-raised hover:bg-surface-hover text-text-muted text-[12px] font-medium rounded-md cursor-pointer transition-colors"
         >
           <Ban size={12} />
           Decline

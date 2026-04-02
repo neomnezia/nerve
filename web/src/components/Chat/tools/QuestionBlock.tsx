@@ -128,10 +128,10 @@ export function QuestionBlock({ block }: { block: ToolCallBlockData }) {
                         submitted
                           ? isSelected
                             ? 'border-indigo-500/40 bg-indigo-500/10 cursor-default'
-                            : 'border-surface-raised bg-[#0e0e12] opacity-40 cursor-default'
+                            : 'border-surface-raised bg-bg-sunken opacity-40 cursor-default'
                           : isSelected
                             ? 'border-indigo-500/50 bg-indigo-500/10 cursor-pointer'
-                            : 'border-border-subtle bg-[#0c0c10] hover:border-[#3a3a4a] hover:bg-[#141420] cursor-pointer'
+                            : 'border-border-subtle bg-bg-sunken hover:border-border hover:bg-surface cursor-pointer'
                       }`}
                     >
                       <div className="flex items-start gap-3">

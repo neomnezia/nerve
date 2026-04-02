@@ -170,7 +170,7 @@ function CategorySummaryEditor({ category }: { category: Category }) {
   if (!isEditing) {
     return (
       <div
-        className="px-3 py-2 bg-bg-sunken text-[11px] text-text-muted whitespace-pre-wrap border-b border-border-subtle group/summary cursor-pointer hover:bg-[#111] transition-colors"
+        className="px-3 py-2 bg-bg-sunken text-[11px] text-text-muted whitespace-pre-wrap border-b border-border-subtle group/summary cursor-pointer hover:bg-surface-hover transition-colors"
         onClick={() => setEditingCategoryId(category.id)}
         title="Click to edit summary"
       >
