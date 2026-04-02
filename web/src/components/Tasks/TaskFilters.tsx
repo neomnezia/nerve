@@ -19,7 +19,7 @@ export function TaskFilters({ active, onChange }: {
           className={`px-3 py-1.5 text-[13px] rounded-md cursor-pointer transition-colors
             ${active === f.value
               ? 'bg-[#6366f1]/15 text-[#6366f1] font-medium'
-              : 'text-[#666] hover:text-[#aaa] hover:bg-[#1a1a1a]'
+              : 'text-text-dim hover:text-[#aaa] hover:bg-surface-raised'
             }`}
         >
           {f.label}

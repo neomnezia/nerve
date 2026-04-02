@@ -47,7 +47,7 @@ export function TaskList() {
         <select
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
-          className="text-sm px-2 py-1 bg-[#252525] border border-[#333] rounded text-[#e0e0e0] outline-none"
+          className="text-sm px-2 py-1 bg-surface-raised border border-border-subtle rounded text-text outline-none"
         >
           <option value="">Active</option>
           <option value="pending">Pending</option>
@@ -58,20 +58,20 @@ export function TaskList() {
       </div>
 
       {loading ? (
-        <div className="text-[#555]">Loading...</div>
+        <div className="text-text-faint">Loading...</div>
       ) : tasks.length === 0 ? (
-        <div className="text-[#555]">No tasks</div>
+        <div className="text-text-faint">No tasks</div>
       ) : (
         <div className="space-y-2">
           {tasks.map((task) => (
             <div
               key={task.id}
-              className="p-3 bg-[#1a1a1a] border border-[#333] rounded"
+              className="p-3 bg-surface-raised border border-border-subtle rounded"
             >
               <div className="flex items-start justify-between">
                 <div>
                   <div className="font-medium">{task.title}</div>
-                  <div className="text-xs text-[#666] mt-1">
+                  <div className="text-xs text-text-dim mt-1">
                     <span className={STATUS_COLORS[task.status] || ''}>{task.status}</span>
                     {task.deadline && <span className="ml-2">Due: {task.deadline}</span>}
                     {task.source && <span className="ml-2">from {task.source}</span>}
@@ -80,7 +80,7 @@ export function TaskList() {
                 <select
                   value={task.status}
                   onChange={(e) => handleStatusChange(task.id, e.target.value)}
-                  className="text-xs px-1.5 py-0.5 bg-[#252525] border border-[#333] rounded text-[#888] outline-none"
+                  className="text-xs px-1.5 py-0.5 bg-surface-raised border border-border-subtle rounded text-text-muted outline-none"
                 >
                   <option value="pending">Pending</option>
                   <option value="in_progress">In Progress</option>
