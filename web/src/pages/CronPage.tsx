@@ -108,7 +108,7 @@ function TriggerButton({ jobId, small = false }: { jobId: string; small?: boolea
   return (
     <button onClick={handleClick} disabled={isTriggering}
       className={`flex items-center gap-1 rounded transition-colors cursor-pointer shrink-0
-        ${isTriggering ? 'text-text-faint cursor-not-allowed' : 'text-text-dim hover:text-text-secondary hover:bg-surface-raised'}
+        ${isTriggering ? 'text-text-faint cursor-not-allowed' : 'text-text-muted hover:text-text-secondary hover:bg-surface-raised'}
         ${small ? 'p-1' : 'px-2 py-1.5 text-[12px]'}`}
       title="Trigger now">
       {isTriggering ? <Loader2 size={small ? 12 : 14} className="animate-spin" /> : <Play size={small ? 12 : 14} />}
@@ -132,7 +132,7 @@ function RotateButton({ jobId }: { jobId: string }) {
   return (
     <button onClick={handleClick} disabled={isRotating}
       className={`flex items-center gap-1 rounded transition-colors cursor-pointer px-2 py-1.5 text-[12px]
-        ${isRotating ? 'text-text-faint cursor-not-allowed' : 'text-text-dim hover:text-text-secondary hover:bg-surface-raised'}`}
+        ${isRotating ? 'text-text-faint cursor-not-allowed' : 'text-text-muted hover:text-text-secondary hover:bg-surface-raised'}`}
       title="Rotate session context">
       {isRotating ? <Loader2 size={14} className="animate-spin" /> : <RotateCw size={14} />}
       {!isRotating && <span>Rotate</span>}
@@ -207,7 +207,7 @@ function JobInfoCard({ job }: { job: CronJob }) {
         <div>
           <div className="flex items-center gap-2 mb-1">
             {jobTypeBadge(job.type)}
-            <span className="text-[14px] text-[#eee] font-medium">{job.id}</span>
+            <span className="text-[14px] text-text font-medium">{job.id}</span>
             {!job.enabled && (
               <span className="text-[10px] px-1.5 py-0.5 rounded bg-border-subtle/50 text-text-muted border border-border-subtle">disabled</span>
             )}
