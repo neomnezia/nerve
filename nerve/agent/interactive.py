@@ -29,6 +29,9 @@ from claude_agent_sdk.types import (
 
 logger = logging.getLogger(__name__)
 
+# Default timeout for interactive tool waits (5 minutes)
+INTERACTION_TIMEOUT = 300
+
 # Tools that require user interaction before execution
 INTERACTIVE_TOOLS = frozenset({
     "AskUserQuestion",
@@ -78,6 +81,7 @@ class InteractiveToolHandler:
         session_id: str,
         broadcast_fn,
         snapshot_fn: SnapshotCallback | None = None,
+        interactive_capable: bool = True,
     ):
         """
         Args:
@@ -85,10 +89,14 @@ class InteractiveToolHandler:
             broadcast_fn: async fn(session_id, message_dict) — the broadcaster.
             snapshot_fn: Optional async fn(session_id, file_path, content) — persists
                          original file content before modification for diff view.
+            interactive_capable: Whether the session channel supports interactive
+                                 tools (WebSocket UI). Non-interactive channels
+                                 (Telegram, cron) auto-deny to prevent deadlocks.
         """
         self.session_id = session_id
         self._broadcast = broadcast_fn
         self._snapshot_fn = snapshot_fn
+        self._interactive_capable = interactive_capable
         self._pending: dict[str, PendingInteraction] = {}
         self._captured_files: set[str] = set()  # paths already snapshotted this session
 
@@ -117,6 +125,32 @@ class InteractiveToolHandler:
 
         if tool_name not in INTERACTIVE_TOOLS:
             return PermissionResultAllow()
+
+        # Non-interactive channels: deny immediately to prevent deadlocks
+        if not self._interactive_capable:
+            deny_messages = {
+                "AskUserQuestion": (
+                    "AskUserQuestion is not available in this channel. "
+                    "Use the Nerve `ask_user` tool to ask the user questions asynchronously."
+                ),
+                "EnterPlanMode": (
+                    "Plan mode is not available in non-web sessions. "
+                    "Proceed with implementation directly."
+                ),
+                "ExitPlanMode": (
+                    "Plan mode is not available in non-web sessions."
+                ),
+            }
+            logger.info(
+                "Session %s: auto-denying %s (non-interactive channel)",
+                self.session_id, tool_name,
+            )
+            return PermissionResultDeny(
+                message=deny_messages.get(
+                    tool_name,
+                    f"{tool_name} is not available in this channel.",
+                )
+            )
 
         return await self._handle_interactive(tool_name, tool_input)
 
@@ -148,7 +182,16 @@ class InteractiveToolHandler:
         )
 
         try:
-            await pending.event.wait()
+            await asyncio.wait_for(pending.event.wait(), timeout=INTERACTION_TIMEOUT)
+        except asyncio.TimeoutError:
+            self._pending.pop(interaction_id, None)
+            logger.warning(
+                "Session %s: interaction %s timed out after %ds",
+                self.session_id, interaction_id[:8], INTERACTION_TIMEOUT,
+            )
+            return PermissionResultDeny(
+                message=f"No response received after {INTERACTION_TIMEOUT // 60} minutes — timed out.",
+            )
         except asyncio.CancelledError:
             self._pending.pop(interaction_id, None)
             logger.info("Session %s: interaction %s cancelled", self.session_id, interaction_id[:8])

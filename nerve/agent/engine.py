@@ -840,11 +840,15 @@ class AgentEngine:
             # Determine if this is a fork
             is_fork = fork_from is not None
 
-            # Create interactive tool handler for this session
+            # Create interactive tool handler for this session.
+            # Non-web sessions (telegram, cron, hook) cannot handle interactive
+            # tools — auto-deny them to prevent deadlocks.
+            is_interactive = source in ("web",)
             handler = InteractiveToolHandler(
                 session_id=session_id,
                 broadcast_fn=broadcaster.broadcast,
                 snapshot_fn=self._save_file_snapshot,
+                interactive_capable=is_interactive,
             )
             register_handler(session_id, handler)
 
