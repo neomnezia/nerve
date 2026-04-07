@@ -1344,6 +1344,8 @@ class AgentEngine:
         last_usage: dict | None = None
         sdk_session_id: str | None = None
         active_subagents: dict[str, float] = {}  # tool_use_id -> monotonic start
+        result_meta: dict | None = None  # ResultMessage fields beyond usage
+        last_model: str | None = None  # model from most recent AssistantMessage
 
         try:
             # Get or create persistent client for this session
@@ -1458,6 +1460,10 @@ class AgentEngine:
 
                         if isinstance(message, AssistantMessage):
                             _got_response_content = True
+                            # Capture model from assistant message (more reliable than config)
+                            msg_model = getattr(message, 'model', None)
+                            if msg_model:
+                                last_model = msg_model
                             # Extract parent_tool_use_id — set when this message
                             # comes from a sub-agent (Task) rather than the main agent
                             parent_id = getattr(message, 'parent_tool_use_id', None)
@@ -1544,6 +1550,12 @@ class AgentEngine:
                             if message.usage:
                                 last_usage = message.usage
                             sdk_session_id = message.session_id
+                            result_meta = {
+                                "total_cost_usd": getattr(message, "total_cost_usd", None),
+                                "duration_ms": getattr(message, "duration_ms", None),
+                                "duration_api_ms": getattr(message, "duration_api_ms", None),
+                                "num_turns": getattr(message, "num_turns", None),
+                            }
 
                 except asyncio.CancelledError:
                     raise  # propagate to outer handler
@@ -1711,20 +1723,60 @@ class AgentEngine:
 
         # Persist usage for context bar on session switch
         max_context = 1_048_576 if self.config.agent.context_1m else 200_000
+        num_turns = (result_meta or {}).get("num_turns") or 1
         if last_usage:
             usage_data = {
                 **last_usage,
                 "max_context_tokens": max_context,
+                "num_turns": num_turns,
             }
             session_record = await self.db.get_session(session_id)
             meta = json.loads(session_record.get("metadata") or "{}") if session_record else {}
             meta["last_usage"] = usage_data
             await self.db.update_session_metadata(session_id, meta)
 
+            # Extract server_tool_use counts
+            server_tool = last_usage.get("server_tool_use") or {}
+            web_search = server_tool.get("web_search_requests", 0)
+            web_fetch = server_tool.get("web_fetch_requests", 0)
+
+            # Use SDK-provided cost when available, otherwise estimate
+            from nerve.db.usage import estimate_turn_cost
+            sdk_cost = (result_meta or {}).get("total_cost_usd")
+            cost = sdk_cost if sdk_cost is not None else estimate_turn_cost(
+                last_usage, model=last_model,
+            )
+
+            # Persist per-turn usage to session_usage table
+            await self.db.record_turn_usage(
+                session_id=session_id,
+                input_tokens=last_usage.get("input_tokens", 0),
+                output_tokens=last_usage.get("output_tokens", 0),
+                cache_creation=last_usage.get("cache_creation_input_tokens", 0),
+                cache_read=last_usage.get("cache_read_input_tokens", 0),
+                max_context=max_context,
+                model=last_model,
+                cost_usd=cost,
+                duration_ms=(result_meta or {}).get("duration_ms"),
+                duration_api_ms=(result_meta or {}).get("duration_api_ms"),
+                num_turns=num_turns,
+                web_search_requests=web_search,
+                web_fetch_requests=web_fetch,
+            )
+
+            # Update total_cost_usd on the session
+            current_cost = (
+                session_record.get("total_cost_usd", 0) if session_record else 0
+            )
+            await self.db.update_session_fields(session_id, {
+                "total_cost_usd": (current_cost or 0) + cost,
+            })
+
         await broadcaster.broadcast_done(
             session_id,
             usage=last_usage,
             max_context_tokens=max_context,
+            num_turns=num_turns,
         )
         self.sessions.touch(session_id)
 

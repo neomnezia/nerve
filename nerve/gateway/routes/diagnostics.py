@@ -76,6 +76,25 @@ async def diagnostics(user: dict = Depends(require_auth)):
     # Task / FTS health (async via DB method)
     tasks_health = await deps.db.get_task_health_stats()
 
+    # Token usage analytics
+    usage_data = {}
+    try:
+        usage_summary = await deps.db.get_usage_summary(days=7)
+        cache_stats = await deps.db.get_cache_hit_rate(days=7)
+        daily_usage = await deps.db.get_usage_by_period(days=7)
+        source_usage = await deps.db.get_usage_by_source(days=7)
+        model_usage = await deps.db.get_usage_by_model(days=7)
+
+        usage_data = {
+            "last_7d": usage_summary,
+            "cache_hit_rate": cache_stats,
+            "daily": daily_usage,
+            "by_source": source_usage,
+            "by_model": model_usage,
+        }
+    except Exception:
+        pass
+
     return {
         "system": {
             "platform": platform.platform(),
@@ -94,6 +113,7 @@ async def diagnostics(user: dict = Depends(require_auth)):
             **_memorize_stats,
             "sessions_pending": pending_count,
         },
+        "usage": usage_data,
     }
 
 

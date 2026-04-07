@@ -139,7 +139,7 @@ export function ChatPage() {
                   <span className="tabular-nums">{fileCount}</span>
                 </button>
               )}
-              {contextUsage && <ContextBar usage={contextUsage} />}
+              {contextUsage && <ContextBar usage={contextUsage} sessionCostUsd={sessions.find(s => s.id === activeSession)?.total_cost_usd} />}
             </div>
           </div>
 

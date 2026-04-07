@@ -149,12 +149,20 @@ class StreamBroadcaster:
             msg["parent_tool_use_id"] = parent_tool_use_id
         await self.broadcast(session_id, msg)
 
-    async def broadcast_done(self, session_id: str, usage: dict[str, Any] | None = None, max_context_tokens: int | None = None) -> None:
+    async def broadcast_done(
+        self,
+        session_id: str,
+        usage: dict[str, Any] | None = None,
+        max_context_tokens: int | None = None,
+        num_turns: int | None = None,
+    ) -> None:
         msg: dict[str, Any] = {"type": "done", "session_id": session_id}
         if usage is not None:
             msg["usage"] = usage
         if max_context_tokens is not None:
             msg["max_context_tokens"] = max_context_tokens
+        if num_turns is not None:
+            msg["num_turns"] = num_turns
         await self.broadcast(session_id, msg)
 
     async def broadcast_plan_update(self, session_id: str, content: str) -> None:

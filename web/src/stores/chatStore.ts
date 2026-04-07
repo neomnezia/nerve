@@ -55,6 +55,7 @@ interface ChatState {
     cache_creation_input_tokens: number;
     cache_read_input_tokens: number;
     max_context_tokens: number;
+    num_turns: number;
   } | null;
   // TodoWrite panel state
   currentTodos: TodoItem[];
@@ -335,6 +336,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           cache_creation_input_tokens: data.last_usage.cache_creation_input_tokens || 0,
           cache_read_input_tokens: data.last_usage.cache_read_input_tokens || 0,
           max_context_tokens: data.last_usage.max_context_tokens || 200_000,
+          num_turns: data.last_usage.num_turns || 1,
         };
       }
       // Restore todos from last TodoWrite call in history
