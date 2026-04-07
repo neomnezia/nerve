@@ -116,13 +116,15 @@ class UsageStore:
             row = await cursor.fetchone()
             total_read = row[0] or 0
             total_creation = row[1] or 0
-            total_input = row[2] or 0
-            rate = total_read / total_input if total_input > 0 else 0.0
+            fresh_input = row[2] or 0
+            # SDK's input_tokens is only non-cached input; real total includes all three
+            total_all_input = fresh_input + total_read + total_creation
+            rate = total_read / total_all_input if total_all_input > 0 else 0.0
             return {
                 "rate": round(rate, 4),
                 "total_read": total_read,
                 "total_creation": total_creation,
-                "total_input": total_input,
+                "total_input": total_all_input,
             }
 
     async def get_usage_summary(self, days: int = 7) -> dict:
@@ -166,14 +168,15 @@ def estimate_turn_cost(usage: dict) -> float:
     - Output: $75/M tokens
     - Cache read: $1.50/M tokens (90% discount)
     - Cache write: $18.75/M tokens (25% premium)
+
+    NOTE: The SDK's ``input_tokens`` is already the *non-cached* portion.
+    Total input = input_tokens + cache_read + cache_creation.
     """
-    input_t = usage.get("input_tokens", 0)
+    fresh_input = usage.get("input_tokens", 0)
     output_t = usage.get("output_tokens", 0)
     cache_read = usage.get("cache_read_input_tokens", 0)
     cache_create = usage.get("cache_creation_input_tokens", 0)
 
-    # Non-cached input = total input - cache_read - cache_create
-    fresh_input = max(0, input_t - cache_read - cache_create)
     cost = (
         fresh_input * 15 / 1_000_000        # regular input
         + cache_read * 1.5 / 1_000_000      # cache read (90% off)
