@@ -735,10 +735,13 @@ class AgentEngine:
             skill_summaries=skill_summaries,
         )
 
-        thinking_config = self._parse_thinking_config(self.config.agent.thinking)
+        thinking_config = self._parse_thinking_config(
+            self.config.agent.thinking,
+            model or self.config.agent.model,
+        )
         effort = (
             self.config.agent.effort
-            if self.config.agent.effort in ("low", "medium", "high", "max")
+            if self.config.agent.effort in ("low", "medium", "high", "xhigh", "max")
             else None
         )
         betas = (
@@ -763,6 +766,14 @@ class AgentEngine:
                 # Non-debug lines (e.g. raw warnings from the CLI)
                 logger.warning("CLI stderr [%s]: %s", session_id[:8], stripped)
 
+        extra_args: dict[str, str | None] = {"debug-to-stderr": None}
+        # Opus 4.7 defaults thinking.display to "omitted", returning empty
+        # thinking blocks with only a signature (for multi-turn continuity).
+        # Force "summarized" so the UI actually has thinking text to render.
+        # The CLI ignores this flag when thinking is disabled.
+        if thinking_config and thinking_config.get("type") != "disabled":
+            extra_args["thinking-display"] = "summarized"
+
         return ClaudeAgentOptions(
             model=model or self.config.agent.model,
             system_prompt=system_prompt,
@@ -777,7 +788,7 @@ class AgentEngine:
             fork_session=fork_session,
             hooks=hooks,
             stderr=_cli_stderr,
-            extra_args={"debug-to-stderr": None},
+            extra_args=extra_args,
             # No allowed_tools — can_use_tool callback handles permissions.
             # External MCP server tools are discovered at connection time,
             # so we can't enumerate them upfront.
@@ -904,12 +915,23 @@ class AgentEngine:
         }
 
     @staticmethod
-    def _parse_thinking_config(value: str) -> dict | None:
+    def _model_supports_legacy_enabled_thinking(model: str | None) -> bool:
+        # Claude 4.5 / 4.6 accept thinking.type="enabled" with budget_tokens.
+        # Newer models (4.7+) require thinking.type="adaptive" with effort.
+        if not model:
+            return False
+        m = model.lower()
+        return "4-5" in m or "4-6" in m
+
+    @staticmethod
+    def _parse_thinking_config(value: str, model: str | None = None) -> dict | None:
         """Parse thinking config string into SDK ThinkingConfig dict."""
         v = value.strip().lower()
         if v == "disabled":
             return {"type": "disabled"}
         if v == "adaptive":
+            return {"type": "adaptive"}
+        if not AgentEngine._model_supports_legacy_enabled_thinking(model):
             return {"type": "adaptive"}
         budget_map = {
             "max": 128_000,
@@ -1503,7 +1525,15 @@ class AgentEngine:
                                 elif ThinkingBlock is not None and isinstance(
                                     block, ThinkingBlock,
                                 ):
-                                    thinking = getattr(block, "thinking", None) or str(block)
+                                    thinking = getattr(block, "thinking", "") or ""
+                                    if not thinking:
+                                        # Empty thinking block (e.g. Opus 4.7 with
+                                        # display="omitted", or simple queries on
+                                        # low effort). Nothing visible to render —
+                                        # never fall back to str(block) as that
+                                        # leaks the ThinkingBlock(...) repr into
+                                        # the UI.
+                                        continue
                                     thinking_text += thinking
                                     # Track ordered blocks for DB persistence
                                     if ordered_blocks and ordered_blocks[-1].get("type") == "thinking":

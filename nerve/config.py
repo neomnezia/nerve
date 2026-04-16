@@ -99,19 +99,19 @@ class ProviderConfig:
 
 @dataclass
 class AgentConfig:
-    model: str = "claude-opus-4-6"
+    model: str = "claude-opus-4-7"
     cron_model: str = "claude-sonnet-4-6"
     title_model: str = "claude-haiku-4-5-20251001"  # Session title generation
     max_turns: int = 100
     max_concurrent: int = 4
     thinking: str = "max"       # max, high, medium, low, disabled, adaptive, or number (budget_tokens)
-    effort: str = "max"         # max, high, medium, low
+    effort: str = "max"         # max, xhigh, high, medium, low
     context_1m: bool = True     # Enable 1M context window beta
 
     @classmethod
     def from_dict(cls, d: dict) -> AgentConfig:
         return cls(
-            model=d.get("model", "claude-opus-4-6"),
+            model=d.get("model", "claude-opus-4-7"),
             cron_model=d.get("cron_model", "claude-sonnet-4-6"),
             title_model=d.get("title_model", "claude-haiku-4-5-20251001"),
             max_turns=d.get("max_turns", 100),
