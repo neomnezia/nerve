@@ -1059,16 +1059,8 @@ async def read_source(args: dict) -> dict:
     return {"content": [{"type": "text", "text": output}]}
 
 
-@tool(
-    "plan_propose",
-    "Propose an implementation plan for a task. The plan will be reviewed and approved by the user asynchronously — it is NOT executed immediately. Use this when you have analyzed a task and want to suggest how to implement it.",
-    {
-        "task_id": {"type": "string", "description": "The task ID to propose a plan for"},
-        "content": {"type": "string", "description": "The plan content in markdown format"},
-        "plan_type": {"type": "string", "description": "Plan type: 'generic' (default), 'skill-create', 'skill-update'. Auto-detected from task source if omitted.", "default": ""},
-    },
-)
-async def plan_propose(args: dict) -> dict:
+async def _plan_propose_impl(args: dict, session_id: str | None = None) -> dict:
+    """Core plan_propose logic. session_id tracks which agent proposed the plan."""
     task_id = args["task_id"]
     content = args["content"]
     plan_type = (args.get("plan_type", "") or "").strip()
@@ -1113,6 +1105,7 @@ async def plan_propose(args: dict) -> dict:
         plan_id=plan_id,
         task_id=task_id,
         content=content,
+        session_id=session_id,  # Track which agent proposed this plan
         model="",
         version=version,
         plan_type=plan_type,
@@ -1125,6 +1118,22 @@ async def plan_propose(args: dict) -> dict:
     })
 
     return {"content": [{"type": "text", "text": f"Plan proposed: {plan_id} (v{version}) for task '{task['title']}'. Awaiting human review."}]}
+
+
+_PLAN_PROPOSE_SCHEMA = {
+    "task_id": {"type": "string", "description": "The task ID to propose a plan for"},
+    "content": {"type": "string", "description": "The plan content in markdown format"},
+    "plan_type": {"type": "string", "description": "Plan type: 'generic' (default), 'skill-create', 'skill-update'. Auto-detected from task source if omitted.", "default": ""},
+}
+
+
+@tool(
+    "plan_propose",
+    "Propose an implementation plan for a task. The plan will be reviewed and approved by the user asynchronously — it is NOT executed immediately. Use this when you have analyzed a task and want to suggest how to implement it.",
+    _PLAN_PROPOSE_SCHEMA,
+)
+async def plan_propose(args: dict) -> dict:
+    return await _plan_propose_impl(args)
 
 
 @tool(
@@ -1397,15 +1406,15 @@ async def plan_revise(args: dict) -> dict:
         f'plan_propose(task_id="{plan["task_id"]}", content="...") with the revised plan.'
     )
 
-    session_id = "cron:task-planner"
+    session_id = plan.get("session_id") or "cron:task-planner"
     await _engine.sessions.get_or_create(
-        session_id, title="Cron: task-planner", source="cron",
+        session_id, title=f"Cron: {session_id.split(':')[-1]}" if session_id.startswith("cron:") else session_id, source="cron",
     )
     asyncio.create_task(
         _engine.run(session_id=session_id, user_message=feedback_prompt, source="cron")
     )
 
-    return {"content": [{"type": "text", "text": f"Revision requested for {plan_id}. Feedback sent to planner session."}]}
+    return {"content": [{"type": "text", "text": f"Revision requested for {plan_id}. Feedback sent to planner session ({session_id})."}]}
 
 
 # --- Skill tools ---
@@ -2089,6 +2098,17 @@ def create_session_mcp_server(session_id: str):
         # session_id captured from enclosing scope — race-free
         return await _send_sticker_impl(args, session_id)
 
+    # --- plan_propose session-scoped (needs session_id for proposer attribution) ---
+
+    @tool(
+        "plan_propose",
+        "Propose an implementation plan for a task. The plan will be reviewed and approved by the user asynchronously — it is NOT executed immediately. Use this when you have analyzed a task and want to suggest how to implement it.",
+        _PLAN_PROPOSE_SCHEMA,
+    )
+    async def session_plan_propose(args: dict) -> dict:
+        # session_id captured from enclosing scope — tracks which agent proposed the plan
+        return await _plan_propose_impl(args, session_id=session_id)
+
     # --- houseofagents session-scoped tool (needs session_id for streaming) ---
 
     _HOA_EXECUTE_SCHEMA = {
@@ -2193,8 +2213,8 @@ def create_session_mcp_server(session_id: str):
         return {"content": [{"type": "text", "text": f"Sent file: {filename} ({file_size:,} bytes)"}]}
 
     # Shared tools (don't need session context) + session-scoped tools
-    shared_tools = [t for t in ALL_TOOLS if t.name not in ("notify", "ask_user", "react", "send_sticker")]
-    session_tools: list[SdkMcpTool] = [session_notify, session_ask_user, session_react, session_send_sticker, session_send_file]
+    shared_tools = [t for t in ALL_TOOLS if t.name not in ("notify", "ask_user", "react", "send_sticker", "plan_propose")]
+    session_tools: list[SdkMcpTool] = [session_notify, session_ask_user, session_react, session_send_sticker, session_plan_propose, session_send_file]
 
     # Only include houseofagents tools when enabled — saves context tokens otherwise
     hoa_enabled = _config and _config.houseofagents.enabled
