@@ -1758,9 +1758,17 @@ async def _send_file_impl(args: dict, session_id: str) -> dict:
     if not resolved.exists() or not resolved.is_file():
         return {"content": [{"type": "text", "text": f"Error: file not found: {file_path}"}]}
 
-    # Security: must be within workspace
-    if _workspace and not str(resolved).startswith(str(_workspace.resolve())):
-        return {"content": [{"type": "text", "text": "Error: file must be within the workspace."}]}
+    # Security: must be within workspace.
+    # Use path-aware containment (``Path.is_relative_to``) instead of a
+    # string prefix check — string prefix lets sibling-prefix paths
+    # bypass the guard (e.g. workspace ``/srv/ws`` would incorrectly
+    # accept ``/srv/ws-evil/secret.txt``). Now that send_file performs
+    # real channel delivery, that gap is exfiltration-capable.
+    if _workspace:
+        try:
+            resolved.relative_to(_workspace.resolve())
+        except ValueError:
+            return {"content": [{"type": "text", "text": "Error: file must be within the workspace."}]}
 
     filename = resolved.name
     file_size = resolved.stat().st_size

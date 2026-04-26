@@ -356,6 +356,29 @@ class TestSendFileImpl:
             )
         assert "must be within the workspace" in result["content"][0]["text"]
 
+    async def test_sibling_prefix_bypass_blocked(self, tmp_path):
+        """Sibling directory whose path *string-prefixes* the workspace
+        must NOT pass the workspace guard. Without ``is_relative_to``-
+        style containment, ``/tmp/ws-evil/secret.txt`` would slip past
+        ``startswith("/tmp/ws")`` — Codex P1 review on PR #1 / e773296.
+        """
+        from nerve.agent import tools
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        # Sibling directory whose name shares the workspace prefix.
+        sibling = tmp_path / "ws-evil"
+        sibling.mkdir()
+        evil = sibling / "secret.txt"
+        evil.write_text("would be exfiltrated")
+
+        with patch.object(tools, "_workspace", workspace), \
+             patch.object(tools, "_engine", MagicMock()):
+            result = await tools._send_file_impl(
+                {"file_path": str(evil)}, "sess"
+            )
+        assert "must be within the workspace" in result["content"][0]["text"]
+
     async def test_engine_unavailable_falls_back(self, tmp_path):
         from nerve.agent import tools
 
