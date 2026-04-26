@@ -177,50 +177,59 @@ def _smart_split(text: str, limit: int = MAX_MSG_LEN) -> list[str]:
     if inner_limit < 64:
         inner_limit = 64
 
-    # Paragraph-level greedy packing.
+    # Atom-level greedy packing.
     #
-    # ``text.split("\n\n")`` consumes the paragraph separators, so when a
-    # chunk boundary falls between two source paragraphs we need to
-    # re-insert the ``\n\n`` somewhere or naïve reassembly (joining chunk
-    # bodies in order) would silently mutate the Markdown structure
-    # ("para_a\n\npara_b" → "para_apara_b"). The ``needs_sep`` flag
-    # carries this obligation across iterations: when set, the first
-    # chunk of the next paragraph (whether normal-path or oversized-path)
-    # is prepended with ``\n\n`` to encode the boundary.
+    # ``text.split("\n\n")`` consumes the paragraph separators, so naïve
+    # reassembly via concatenation would silently mutate Markdown
+    # structure ("para_a\n\npara_b" → "para_apara_b"). To make the
+    # planning loop trivially correct, we re-insert the consumed
+    # separators as their own "atoms" and pack the resulting flat
+    # alternating list of (paragraph, "\n\n", paragraph, ...) atoms.
+    #
+    # Contract: concatenating the (marker-stripped) chunks reproduces the
+    # original text exactly. Every separator atom is part of some chunk's
+    # content, so no boundary information is lost regardless of where the
+    # planner decides to split.
+    #
+    # This replaces the earlier ``needs_sep`` / ``extras`` flag-based
+    # bookkeeping (Codex rounds 6 and 7), which double-counted the
+    # implicit ``\n\n`` in normal→normal transitions and dropped extra
+    # ``\n\n`` runs from blank-paragraph collapse and leading/trailing
+    # blanks. Treating separators as first-class atoms makes those edge
+    # cases impossible by construction.
     paragraphs = text.split("\n\n")
+    atoms: list[str] = []
+    for i, para in enumerate(paragraphs):
+        if i > 0:
+            atoms.append("\n\n")
+        atoms.append(para)
+
     chunks: list[str] = []
     current = ""
-    needs_sep = False
-    for para in paragraphs:
-        if not para:
-            # ``text.split("\n\n")`` yields empty strings for runs of
-            # ``\n\n\n\n`` (e.g. whitespace-only inputs). Skipping them
-            # avoids accumulating spurious separators in ``current`` while
-            # still letting ``needs_sep`` carry a real boundary forward.
+    for atom in atoms:
+        if not atom:
+            # Empty paragraphs contribute no content; the surrounding
+            # ``\n\n`` separator atoms already encode the boundary.
             continue
-        if len(para) > inner_limit:
-            # Flush current, then this paragraph needs finer split.
+        if len(atom) > inner_limit:
+            # Only paragraph atoms can exceed ``inner_limit`` (separator
+            # atoms are exactly 2 chars). Oversized paragraphs are
+            # split internally; each sub-chunk is content-only with no
+            # need for a bridge prefix because the preceding ``\n\n``
+            # separator atom (if any) was already packed into ``current``
+            # or its own chunk.
             if current:
                 chunks.append(current)
                 current = ""
-            sub_chunks = _split_paragraph(para, inner_limit)
-            if needs_sep and sub_chunks:
-                sub_chunks[0] = "\n\n" + sub_chunks[0]
+            sub_chunks = _split_paragraph(atom, inner_limit)
             chunks.extend(sub_chunks)
-            needs_sep = True
             continue
-        if needs_sep:
-            # Boundary owed from the previous paragraph; encode it on the
-            # leading edge of this one so reassembly reproduces the source.
-            para = "\n\n" + para
-            needs_sep = False
-        candidate = f"{current}\n\n{para}" if current else para
+        candidate = current + atom
         if len(candidate) <= inner_limit:
             current = candidate
         else:
             chunks.append(current)
-            current = para
-        needs_sep = True
+            current = atom
     if current:
         chunks.append(current)
 
@@ -799,8 +808,18 @@ class TelegramChannel(BaseChannel):
         bursty caller does not lose chunks when the per-chat rate ceiling
         is hit. Bounded at 3 attempts to avoid unbounded blocking on a
         persistently-rate-limited chat.
+
+        On exhaustion (Codex round-7 P1), the last ``RetryAfter`` is
+        re-raised so the caller knows delivery failed. ``_send_inline_chunks``
+        then aborts further chunk sends (the chat-wide rate ceiling won't
+        clear by switching chunks), and ``send()`` lets the exception
+        propagate to ``StreamAdapter._handle_done``, which keeps the
+        streaming placeholder instead of deleting it. Without this raise,
+        callers saw a "successful" send while the response tail was lost
+        and the placeholder was deleted.
         """
         html_chunk = _md_to_tg_html(chunk)
+        last_exc: BaseException | None = None
         for attempt in range(3):
             try:
                 sent = await self._app.bot.send_message(
@@ -809,6 +828,7 @@ class TelegramChannel(BaseChannel):
                     parse_mode=ParseMode.HTML,
                 )
             except RetryAfter as exc:
+                last_exc = exc
                 wait = float(getattr(exc, "retry_after", 1.0))
                 logger.warning(
                     "_send_chunk_with_retry: flood-wait %.1fs (attempt %d/3)",
@@ -824,6 +844,7 @@ class TelegramChannel(BaseChannel):
                         text=chunk,
                     )
                 except RetryAfter as exc:
+                    last_exc = exc
                     wait = float(getattr(exc, "retry_after", 1.0))
                     logger.warning(
                         "_send_chunk_with_retry: flood-wait on plain fallback "
@@ -836,6 +857,13 @@ class TelegramChannel(BaseChannel):
         logger.error(
             "_send_chunk_with_retry: gave up after 3 attempts for chat %d",
             chat_id,
+        )
+        # Surface the failure so the caller can stop sending further
+        # chunks and preserve the streaming placeholder.
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(
+            f"_send_chunk_with_retry exhausted retries for chat {chat_id}"
         )
 
     def _build_file_summary(self, text: str) -> str:

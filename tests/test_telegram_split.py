@@ -496,6 +496,88 @@ def test_long_language_tag_does_not_overflow_chunks():
     assert not over2, f"chunks exceeding MAX_MSG_LEN with 500-char tag: {over2}"
 
 
+def test_blank_paragraph_runs_preserved_across_split():
+    """Codex P2 (round 7): ``text.split("\\n\\n")`` yields empty strings
+    for runs of multiple blank-line separators (e.g. ``"\\n\\n\\n\\n"``
+    splits as ``['', '', '']``). The previous planning loop skipped empty
+    entries, silently collapsing multi-blank runs and dropping
+    leading/trailing blank paragraphs. Concatenating the resulting chunks
+    no longer reproduced the source text.
+
+    The atom-based packing now treats each ``\\n\\n`` separator as a
+    first-class atom, so blank-paragraph runs round-trip exactly.
+    """
+    import re
+
+    def reassemble(chunks_):
+        return "".join(re.sub(r"^\(\d+/\d+\)\n", "", c) for c in chunks_)
+
+    # Case 1: 6-newline run between two normal paragraphs.
+    text1 = ("a" * 2000) + "\n\n\n\n\n\n" + ("b" * 2000) + "\n\n" + ("c" * 2000)
+    chunks1 = _smart_split(text1, limit=MAX_MSG_LEN)
+    assert reassemble(chunks1) == text1, (
+        f"6-newline run lost: in had {text1.count(chr(10))} \\n, "
+        f"out has {reassemble(chunks1).count(chr(10))} \\n"
+    )
+
+    # Case 2: leading blank paragraphs.
+    text2 = "\n\n\n\n" + ("x" * 5000)
+    chunks2 = _smart_split(text2, limit=MAX_MSG_LEN)
+    assert reassemble(chunks2) == text2, "leading blank paragraphs dropped"
+
+    # Case 3: trailing blank paragraphs.
+    text3 = ("y" * 5000) + "\n\n\n\n"
+    chunks3 = _smart_split(text3, limit=MAX_MSG_LEN)
+    assert reassemble(chunks3) == text3, "trailing blank paragraphs dropped"
+
+    # Case 4: blank paragraphs adjacent to oversized paragraph.
+    text4 = "head\n\n\n\n" + ("Z" * 5000) + "\n\n\n\ntail"
+    chunks4 = _smart_split(text4, limit=MAX_MSG_LEN)
+    assert reassemble(chunks4) == text4, (
+        "blank paragraphs around oversized lost"
+    )
+
+
+def test_retry_after_exhaustion_raises_to_abort_remaining_chunks():
+    """Codex P1 (round 7): on three consecutive ``RetryAfter`` failures
+    ``_send_chunk_with_retry`` previously logged and returned silently,
+    so ``_send_inline_chunks`` kept calling itself for subsequent chunks
+    and ``send()`` looked successful to ``StreamAdapter._handle_done`` —
+    which then deleted the streaming placeholder. The user saw the
+    placeholder vanish while one or more chunks were never delivered.
+
+    The fix re-raises the last ``RetryAfter`` after exhaustion so the
+    inline loop aborts mid-response and the placeholder is preserved.
+    """
+    from telegram.error import RetryAfter
+
+    channel = _make_channel_with_mock_bot()
+    call_count = {"n": 0}
+
+    async def always_flood(*args, **kwargs):
+        call_count["n"] += 1
+        raise RetryAfter(0)
+
+    channel._app.bot.send_message = AsyncMock(side_effect=always_flood)
+    text = "a" * 5000  # produces ≥ 2 chunks
+    msg = OutboundMessage(target="123", text=text)
+
+    raised: BaseException | None = None
+    try:
+        asyncio.run(channel.send(msg))
+    except RetryAfter as exc:
+        raised = exc
+
+    assert raised is not None, (
+        "send() must propagate exhausted RetryAfter so callers know delivery "
+        "failed and can preserve streaming placeholders"
+    )
+    # Exactly 3 retries on the FIRST chunk, then abort — second chunk never tried.
+    assert call_count["n"] == 3, (
+        f"expected 3 attempts on first chunk only (then abort), got {call_count['n']}"
+    )
+
+
 def test_whitespace_only_payload_is_not_silently_dropped():
     """Codex P2 (round 3): an input made only of paragraph separators
     used to return ``[]`` from ``_smart_split`` because the planning loop
