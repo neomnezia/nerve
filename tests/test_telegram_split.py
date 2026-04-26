@@ -695,3 +695,89 @@ def test_balance_code_fences_does_not_strip_trailing_whitespace():
         f"body trailing spaces stripped: {out[0]!r}"
     )
     assert out[0].endswith("\n```"), "fence must be opened on a new line"
+
+
+def test_send_as_file_summary_retries_on_flood_wait():
+    """Codex P2 (round 10): the ``_send_as_file`` summary path used to
+    catch the first send_message exception (potentially a ``RetryAfter``)
+    and immediately attempt a plain-text resend without honoring
+    ``retry_after``. In a rate-limited chat both attempts fail
+    back-to-back and ``send()`` raises even though the document was
+    already uploaded — leaving streaming placeholders in a bad state.
+
+    The fix mirrors ``_send_chunk_with_retry``: HTML attempts honor
+    ``RetryAfter`` (sleep + retry, bounded at 3), then fall back to
+    plain text only on non-retryable exceptions, with the plain path
+    also honoring ``RetryAfter``.
+    """
+    from telegram.error import RetryAfter
+
+    channel = _make_channel_with_mock_bot()
+    text = "a" * (FILE_ATTACH_THRESHOLD + 1)
+
+    call_count = {"n": 0}
+    success_msg = MagicMock(message_id=44)
+
+    async def flood_then_succeed(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] < 3:
+            raise RetryAfter(0)  # zero-second wait keeps test fast
+        return success_msg
+
+    channel._app.bot.send_message = AsyncMock(side_effect=flood_then_succeed)
+    msg = OutboundMessage(target="123", text=text)
+    asyncio.run(channel.send(msg))
+
+    # Document delivered exactly once.
+    assert channel._app.bot.send_document.await_count == 1
+    # Summary attempted 3 times (2 floods + 1 success).
+    assert call_count["n"] == 3, (
+        f"expected 3 summary attempts (2 RetryAfter + 1 success), got {call_count['n']}"
+    )
+    # All attempts used the HTML path — plain-text fallback only fires on
+    # non-retryable exceptions, not on RetryAfter exhaustion or success.
+    for call in channel._app.bot.send_message.await_args_list:
+        assert call.kwargs.get("parse_mode") is not None, (
+            "RetryAfter retries must stay on HTML path, not switch to plain text"
+        )
+
+
+def test_send_as_file_summary_swallows_retry_exhaustion_after_doc_delivered():
+    """Codex P2 (round 10): when summary delivery exhausts retries the
+    document is *already* in the chat, so ``send()`` must not propagate
+    the exception. Otherwise StreamAdapter treats the whole send as
+    failed and clobbers the streaming placeholder, despite the user
+    having received the actual response file.
+    """
+    from telegram.error import RetryAfter
+
+    channel = _make_channel_with_mock_bot()
+    text = "a" * (FILE_ATTACH_THRESHOLD + 1)
+
+    call_count = {"n": 0}
+
+    async def always_flood(*args, **kwargs):
+        call_count["n"] += 1
+        raise RetryAfter(0)
+
+    channel._app.bot.send_message = AsyncMock(side_effect=always_flood)
+    msg = OutboundMessage(target="123", text=text)
+
+    raised: BaseException | None = None
+    try:
+        asyncio.run(channel.send(msg))
+    except BaseException as exc:  # noqa: BLE001 — test asserts no raise
+        raised = exc
+
+    assert raised is None, (
+        f"send() must not raise when summary fails after doc upload, got {raised!r}"
+    )
+    # Document delivered.
+    assert channel._app.bot.send_document.await_count == 1
+    # 3 HTML attempts + 3 plain-text attempts on RetryAfter exhaustion.
+    # (HTML loop completes its 3 retries; plain-text loop also runs 3
+    # because sent is still None and html_failed_non_retryable is False
+    # but attempt == 2 satisfies the fallback condition.)
+    assert call_count["n"] == 6, (
+        f"expected 3 HTML + 3 plain attempts under sustained flood, got {call_count['n']}"
+    )

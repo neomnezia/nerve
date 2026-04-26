@@ -995,19 +995,89 @@ class TelegramChannel(BaseChannel):
             return
 
         # Document succeeded — send the short HTML summary as a follow-up.
+        # Codex P2 (round 10): honor ``RetryAfter`` with bounded retries
+        # on both the HTML and plain-text branches. The previous
+        # implementation caught the first exception (potentially a
+        # ``RetryAfter``) and immediately tried plain-text, which in a
+        # rate-limited chat fails the same way back-to-back, raising up
+        # through ``send()`` even though the file itself was already
+        # uploaded. Streaming callers then mistake the overall delivery
+        # as failed and leave placeholders in a bad state.
+        #
+        # Strategy: mirror ``_send_chunk_with_retry`` (HTML attempts with
+        # flood-wait honored, fall back to plain on non-retryable errors,
+        # plain attempts also honor flood-wait). Difference: on retry
+        # exhaustion we *do not* raise — the document is already
+        # delivered; a missing summary is a cosmetic loss, not a
+        # delivery failure, so the caller must not treat it as one.
         summary_html = self._build_file_summary(text)
-        try:
-            sent = await self._app.bot.send_message(
-                chat_id=chat_id,
-                text=summary_html,
-                parse_mode=ParseMode.HTML,
+        plain_summary = (
+            f"Response is {len(text) / 1024:.0f} KB — delivered as file."
+        )
+        sent = None
+        # Pass 1: HTML attempts with RetryAfter retry. Break out on a
+        # non-retryable exception so the plain-text pass can run.
+        html_failed_non_retryable = False
+        for attempt in range(3):
+            try:
+                sent = await self._app.bot.send_message(
+                    chat_id=chat_id,
+                    text=summary_html,
+                    parse_mode=ParseMode.HTML,
+                )
+                break
+            except RetryAfter as exc:
+                wait = float(getattr(exc, "retry_after", 1.0))
+                logger.warning(
+                    "_send_as_file: summary flood-wait %.1fs (attempt %d/3)",
+                    wait, attempt + 1,
+                )
+                await asyncio.sleep(wait)
+                continue
+            except Exception as exc:
+                logger.warning(
+                    "_send_as_file: HTML summary send failed (%s) — falling back to plain text",
+                    exc,
+                )
+                html_failed_non_retryable = True
+                break
+
+        # Pass 2: plain-text fallback with RetryAfter retry — only if
+        # HTML hit a non-retryable error, or if the HTML retry loop ran
+        # out of attempts on flood-wait (sent is still None).
+        if sent is None and (html_failed_non_retryable or attempt == 2):
+            for plain_attempt in range(3):
+                try:
+                    sent = await self._app.bot.send_message(
+                        chat_id=chat_id,
+                        text=plain_summary,
+                    )
+                    break
+                except RetryAfter as exc:
+                    wait = float(getattr(exc, "retry_after", 1.0))
+                    logger.warning(
+                        "_send_as_file: plain summary flood-wait %.1fs (attempt %d/3)",
+                        wait, plain_attempt + 1,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                except Exception as exc:
+                    logger.warning(
+                        "_send_as_file: plain summary send failed: %s", exc,
+                    )
+                    break
+
+        if sent is None:
+            # Summary delivery failed after retries. The document itself
+            # is already in the chat; do not raise — that would make
+            # callers (StreamAdapter) treat overall delivery as failed
+            # and clobber the streaming placeholder.
+            logger.warning(
+                "_send_as_file: summary delivery exhausted retries for chat %d "
+                "(file already uploaded; summary is cosmetic-only)",
+                chat_id,
             )
-        except Exception:
-            # Plain-text fallback if HTML parse fails.
-            sent = await self._app.bot.send_message(
-                chat_id=chat_id,
-                text=f"Response is {len(text) / 1024:.0f} KB — delivered as file.",
-            )
+            return
         self._cache_message(sent.message_id, chat_id, summary_html)
 
     def format_response(self, text: str) -> str:
