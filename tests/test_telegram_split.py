@@ -357,6 +357,31 @@ def test_fenced_run_with_no_whitespace_anchor_stays_under_limit():
     assert not over, f"chunks exceeding MAX_MSG_LEN: {over}"
 
 
+def test_long_language_tag_does_not_overflow_chunks():
+    """Codex P1 (round 4): Markdown allows arbitrary text in the code-fence
+    info string (language tag). A long tag (>14 chars) inflates the
+    rebalance overhead per chunk past the fixed reserve, so the
+    convergence loop can still emit chunks above ``MAX_MSG_LEN``.
+
+    Repro from Codex: a fenced block with a 100-char tag used to yield a
+    4100-char chunk. The fix scans the input for the longest actual tag
+    and reserves ``8 + max_tag_len`` chars at planning time.
+    """
+    # 100-char info string — well past "typescript" (10 chars).
+    long_tag = "x" * 100
+    text = f"```{long_tag}\n" + "y" * 8000 + "\n```"
+    chunks = _smart_split(text, limit=MAX_MSG_LEN)
+    over = [(i, len(c)) for i, c in enumerate(chunks) if len(c) > MAX_MSG_LEN]
+    assert not over, f"chunks exceeding MAX_MSG_LEN: {over}"
+
+    # Sanity: a degenerate 500-char tag still doesn't overflow.
+    huge_tag = "a" * 500
+    text2 = f"```{huge_tag}\n" + "y" * 8000 + "\n```"
+    chunks2 = _smart_split(text2, limit=MAX_MSG_LEN)
+    over2 = [(i, len(c)) for i, c in enumerate(chunks2) if len(c) > MAX_MSG_LEN]
+    assert not over2, f"chunks exceeding MAX_MSG_LEN with 500-char tag: {over2}"
+
+
 def test_whitespace_only_payload_is_not_silently_dropped():
     """Codex P2 (round 3): an input made only of paragraph separators
     used to return ``[]`` from ``_smart_split`` because the planning loop

@@ -148,14 +148,23 @@ def _smart_split(text: str, limit: int = MAX_MSG_LEN) -> list[str]:
     marker_overhead = 12
     # If the input contains code fences, every produced chunk that ends
     # mid-fence will gain a closing ``` (4 chars) and the next chunk will
-    # gain an opening ```<lang>\n (up to ~14 chars for "typescript").
-    # Without this reservation the post-balance chunk size can overshoot
-    # ``limit`` for fenced content with no internal whitespace anchors
-    # (e.g. a single 8 K "x" run inside ```python …```), and the
-    # convergence loop cannot close the gap because each rebalance
-    # re-adds the fence markers. Reserving up front prevents the loop
-    # from ever needing to run for fenced inputs.
-    fence_overhead = 18 if "```" in text else 0
+    # gain an opening ```<info-string>\n. Markdown allows the info string
+    # to be any text up to the next newline, so we cannot assume the
+    # familiar short tags like ``python`` — content with a 100-char tag
+    # would push the post-balance chunk past ``limit`` and the
+    # convergence loop below cannot close the gap because each rebalance
+    # re-adds the same wrapping. Reserve based on the *actual* longest
+    # info string in the input.
+    fence_overhead = 0
+    if "```" in text:
+        fence_tags = _FENCE_RE.findall(text)
+        max_tag_len = max((len(t) for t in fence_tags), default=0)
+        # Open `\n```<tag>\n` (we add `\n``` for close and prepend
+        # `\`\`\`<tag>\n` for open — combined worst case per chunk):
+        #   close = len("\n```")               = 4
+        #   open  = len("```") + tag + len("\n") = 3 + tag + 1
+        # Total reservation: 4 + 4 + tag = 8 + tag.
+        fence_overhead = 8 + max_tag_len
     inner_limit = limit - marker_overhead - fence_overhead
 
     # Paragraph-level greedy packing.
