@@ -23,6 +23,7 @@ from typing import Any, TYPE_CHECKING
 
 from telegram import Update
 from telegram.constants import ChatAction, ParseMode
+from telegram.error import RetryAfter
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, MessageReactionHandler, filters
 
 from nerve.channels.base import (
@@ -177,23 +178,49 @@ def _smart_split(text: str, limit: int = MAX_MSG_LEN) -> list[str]:
         inner_limit = 64
 
     # Paragraph-level greedy packing.
+    #
+    # ``text.split("\n\n")`` consumes the paragraph separators, so when a
+    # chunk boundary falls between two source paragraphs we need to
+    # re-insert the ``\n\n`` somewhere or naïve reassembly (joining chunk
+    # bodies in order) would silently mutate the Markdown structure
+    # ("para_a\n\npara_b" → "para_apara_b"). The ``needs_sep`` flag
+    # carries this obligation across iterations: when set, the first
+    # chunk of the next paragraph (whether normal-path or oversized-path)
+    # is prepended with ``\n\n`` to encode the boundary.
     paragraphs = text.split("\n\n")
     chunks: list[str] = []
     current = ""
+    needs_sep = False
     for para in paragraphs:
+        if not para:
+            # ``text.split("\n\n")`` yields empty strings for runs of
+            # ``\n\n\n\n`` (e.g. whitespace-only inputs). Skipping them
+            # avoids accumulating spurious separators in ``current`` while
+            # still letting ``needs_sep`` carry a real boundary forward.
+            continue
         if len(para) > inner_limit:
             # Flush current, then this paragraph needs finer split.
             if current:
                 chunks.append(current)
                 current = ""
-            chunks.extend(_split_paragraph(para, inner_limit))
+            sub_chunks = _split_paragraph(para, inner_limit)
+            if needs_sep and sub_chunks:
+                sub_chunks[0] = "\n\n" + sub_chunks[0]
+            chunks.extend(sub_chunks)
+            needs_sep = True
             continue
+        if needs_sep:
+            # Boundary owed from the previous paragraph; encode it on the
+            # leading edge of this one so reassembly reproduces the source.
+            para = "\n\n" + para
+            needs_sep = False
         candidate = f"{current}\n\n{para}" if current else para
         if len(candidate) <= inner_limit:
             current = candidate
         else:
             chunks.append(current)
             current = para
+        needs_sep = True
     if current:
         chunks.append(current)
 
@@ -750,25 +777,66 @@ class TelegramChannel(BaseChannel):
         path from :meth:`_send_as_file` when a document upload fails — so
         a transient ``send_document`` error never causes total response
         loss.
+
+        Throttling: Telegram caps outbound at 1 message/second/chat for
+        bots. We sleep 1.0 s between chunks to match the documented limit.
+        ``RetryAfter`` from the API is honored explicitly with the
+        server-provided wait, then the chunk is retried so a transient
+        flood-wait does not abort delivery mid-response and drop the tail.
         """
         chunks = _smart_split(text, limit=MAX_MSG_LEN)
         for chunk in chunks:
-            html_chunk = _md_to_tg_html(chunk)
+            await self._send_chunk_with_retry(chat_id, chunk)
+            # Throttle to respect Telegram's 1 msg/sec/chat limit.
+            if len(chunks) > 1:
+                await asyncio.sleep(1.0)
+
+    async def _send_chunk_with_retry(self, chat_id: int, chunk: str) -> None:
+        """Send one chunk with HTML/plain-text fallback and ``RetryAfter`` retry.
+
+        The retry path catches Telegram's flood-wait exception and sleeps
+        for the server-provided ``retry_after`` before re-attempting, so a
+        bursty caller does not lose chunks when the per-chat rate ceiling
+        is hit. Bounded at 3 attempts to avoid unbounded blocking on a
+        persistently-rate-limited chat.
+        """
+        html_chunk = _md_to_tg_html(chunk)
+        for attempt in range(3):
             try:
                 sent = await self._app.bot.send_message(
                     chat_id=chat_id,
                     text=html_chunk,
                     parse_mode=ParseMode.HTML,
                 )
-            except Exception:
-                sent = await self._app.bot.send_message(
-                    chat_id=chat_id,
-                    text=chunk,
+            except RetryAfter as exc:
+                wait = float(getattr(exc, "retry_after", 1.0))
+                logger.warning(
+                    "_send_chunk_with_retry: flood-wait %.1fs (attempt %d/3)",
+                    wait, attempt + 1,
                 )
+                await asyncio.sleep(wait)
+                continue
+            except Exception:
+                # Non-retryable HTML parse / send error — fall back to plain text.
+                try:
+                    sent = await self._app.bot.send_message(
+                        chat_id=chat_id,
+                        text=chunk,
+                    )
+                except RetryAfter as exc:
+                    wait = float(getattr(exc, "retry_after", 1.0))
+                    logger.warning(
+                        "_send_chunk_with_retry: flood-wait on plain fallback "
+                        "%.1fs (attempt %d/3)", wait, attempt + 1,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
             self._cache_message(sent.message_id, chat_id, chunk)
-            # Throttle to respect Telegram's 1 msg/sec/chat limit.
-            if len(chunks) > 1:
-                await asyncio.sleep(0.1)
+            return
+        logger.error(
+            "_send_chunk_with_retry: gave up after 3 attempts for chat %d",
+            chat_id,
+        )
 
     def _build_file_summary(self, text: str) -> str:
         """Build the HTML summary message that accompanies a file attachment.

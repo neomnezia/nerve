@@ -357,6 +357,94 @@ def test_fenced_run_with_no_whitespace_anchor_stays_under_limit():
     assert not over, f"chunks exceeding MAX_MSG_LEN: {over}"
 
 
+def test_paragraph_boundary_preserved_after_oversized_paragraph():
+    """Codex P2 (round 6): the oversized-paragraph branch in
+    ``_smart_split`` flushes ``current`` and appends sub-chunks without
+    re-inserting the ``\\n\\n`` separator that ``text.split("\\n\\n")``
+    consumed. Inputs like ``<long>\\n\\n<next>`` therefore lost the
+    blank-line boundary, mutating Markdown structure across reassembly.
+
+    The fix carries a ``needs_sep`` flag that prepends ``\\n\\n`` to the
+    leading edge of the next paragraph (whether normal-path or
+    oversized-path) so chunk reassembly reproduces the source paragraph
+    structure exactly.
+    """
+    import re
+
+    def reassemble(chunks_):
+        return "".join(re.sub(r"^\(\d+/\d+\)\n", "", c) for c in chunks_)
+
+    # Case 1: oversized followed by short.
+    long_para = "L" * 5000
+    text1 = long_para + "\n\nthis is the next paragraph"
+    chunks1 = _smart_split(text1, limit=MAX_MSG_LEN)
+    assert reassemble(chunks1) == text1, "case 1: oversized → short lost boundary"
+
+    # Case 2: short → oversized → short.
+    text2 = "small_a\n\n" + ("B" * 5000) + "\n\nsmall_c"
+    chunks2 = _smart_split(text2, limit=MAX_MSG_LEN)
+    assert reassemble(chunks2) == text2, "case 2: short → oversized → short lost boundary"
+
+    # Case 3: multiple oversized paragraphs interleaved.
+    text3 = "a\n\n" + ("B" * 5000) + "\n\nc\n\n" + ("D" * 5000) + "\n\ne"
+    chunks3 = _smart_split(text3, limit=MAX_MSG_LEN)
+    assert reassemble(chunks3) == text3, "case 3: multi-oversized lost boundary"
+
+
+def test_inline_throttle_respects_per_chat_rate_limit():
+    """Codex P1 (round 6): ``_send_inline_chunks`` previously slept 0.1 s
+    between chunks, driving ~10 messages/sec — well above Telegram's
+    ``1 msg/sec/chat`` cap. Long split responses could trip flood-wait
+    errors and abort mid-delivery.
+
+    The fix sleeps 1.0 s between chunks. We assert the throttle by
+    measuring the elapsed time around a 3-chunk send; any value below
+    1.5 s means the cap was not honored.
+    """
+    import time
+
+    channel = _make_channel_with_mock_bot()
+    text = "a" * 5000  # produces ≥ 2 chunks (5KB > MAX_MSG_LEN)
+    msg = OutboundMessage(target="123", text=text)
+    start = time.monotonic()
+    asyncio.run(channel.send(msg))
+    elapsed = time.monotonic() - start
+    chunk_count = channel._app.bot.send_message.await_count
+    # Throttle is sleep(1.0) per chunk after the first → expect ≥ 1.0s elapsed.
+    expected_min = 1.0 * (chunk_count - 1)
+    assert elapsed >= expected_min - 0.1, (
+        f"throttle too fast: {elapsed:.2f}s elapsed for {chunk_count} chunks "
+        f"(expected ≥ {expected_min:.2f}s)"
+    )
+
+
+def test_inline_chunk_send_retries_on_retry_after_exception():
+    """Codex P1 (round 6): the previous code had no retry/backoff for
+    Telegram's ``RetryAfter`` (flood-wait) exception, so a transient
+    rate-limit hit aborted chunk delivery and dropped the response tail.
+    The fix catches ``RetryAfter``, sleeps for the server-provided wait,
+    then retries.
+    """
+    from telegram.error import RetryAfter
+
+    channel = _make_channel_with_mock_bot()
+    # First call raises RetryAfter(0), second succeeds.
+    call_count = {"n": 0}
+
+    async def maybe_flood(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RetryAfter(0)  # zero-second wait keeps test fast
+        return MagicMock(message_id=42)
+
+    channel._app.bot.send_message = AsyncMock(side_effect=maybe_flood)
+    text = "small payload that fits in one chunk"
+    msg = OutboundMessage(target="123", text=text)
+    asyncio.run(channel.send(msg))
+    # Two attempts: the first hit RetryAfter, the second succeeded.
+    assert call_count["n"] == 2, f"expected retry, got {call_count['n']} attempts"
+
+
 def test_adversarial_fence_tag_does_not_crash_or_drop_content():
     """Codex P1 (round 5): an extremely long fence info string makes
     ``fence_overhead = 8 + max_tag_len`` collapse ``inner_limit`` to zero
