@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import zipfile
+from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from telegram import Update
@@ -620,28 +621,19 @@ class TelegramChannel(BaseChannel):
         """Deliver a file to a Telegram chat as a document attachment.
 
         Size limits are enforced by the Telegram API itself (50 MiB on
-        api.telegram.org, up to 2 GiB on a self-hosted Bot API server).
-        We surface the API's verdict via the ``send_document`` exception
-        path rather than hard-coding the cap client-side, so this code
-        stays correct if the user runs against a local Bot API server.
+        api.telegram.org, up to 2 GiB on self-hosted Bot API servers).
         """
         if self._app is None:
             return False
-        from pathlib import Path
-        try:
-            resolved = Path(file_path).resolve()
-        except (OSError, RuntimeError) as e:
-            logger.warning("send_file: failed to resolve %s: %s", file_path, e)
-            return False
-        if not resolved.exists() or not resolved.is_file():
+        path = Path(file_path)
+        if not path.is_file():
             return False
         try:
-            with open(resolved, "rb") as f:
-                await self._app.bot.send_document(
-                    chat_id=int(target),
-                    document=f,
-                    filename=resolved.name,
-                )
+            await self._app.bot.send_document(
+                chat_id=int(target),
+                document=path,
+                filename=path.name,
+            )
             return True
         except Exception as e:
             logger.warning("send_file: send_document failed for %s: %s", target, e)

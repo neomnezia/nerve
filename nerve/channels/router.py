@@ -331,47 +331,30 @@ class ChannelRouter:
         file_path: str,
         channel: str | None = None,
     ) -> bool:
-        """Deliver a file to the chat associated with a session.
+        """Deliver a file via the channel passed by the caller.
 
-        Dispatch is restricted to the channel passed by the caller.
-        ``_message_context`` is consulted ONLY to look up the target
-        identifier when the cached context's channel matches the
-        requested ``channel`` — never to choose which channel to send
-        through. This prevents cross-channel leakage when the cached
-        context belongs to a different (prior) inbound channel.
+        Refuses delivery if ``channel`` is None — falling back to
+        ``_message_context`` would leak files from cron/planner runs
+        to whatever chat last touched the session (e.g. a stale
+        Telegram inbound from hours earlier).
 
-        When ``channel`` is ``None`` (no active channel known —
-        e.g. cron / planner runs that drive ``engine.run()`` without
-        a channel arg), delivery is refused. The agent's fallback
-        message points the user to the web panel; the persisted
-        ``send_file`` tool_call block still renders as a SendFileBlock
-        download card on the web frontend regardless.
+        ``_message_context`` is consulted only to look up the target
+        identifier when its cached channel matches the requested
+        ``channel``; otherwise the target is empty. Channels needing
+        a real target (Telegram) fail safely inside their own
+        ``send_file``; broadcast channels (web) succeed regardless.
 
-        Returns True if the file was delivered, False otherwise
-        (unknown active channel, missing channel registration, missing
-        SEND_FILES capability, channel-level delivery failure).
+        Returns True on successful delivery, False otherwise.
         """
         if channel is None:
-            # No active channel — refuse rather than fall back to
-            # ``_message_context``. Falling back was an exfiltration
-            # vector: cron/planner sessions could leak files to a stale
-            # Telegram chat from a prior inbound message.
             return False
 
         chan_obj = self._channels.get(channel)
         if not chan_obj or ChannelCapability.SEND_FILES not in chan_obj.capabilities:
             return False
 
-        # Reuse cached target only when the context channel matches the
-        # requested channel. Mismatched/missing context → empty target.
-        # Channels that require a real target (e.g. Telegram) will fail
-        # safely inside their own ``send_file`` impl; channels that
-        # broadcast (e.g. web) succeed regardless of target.
         ctx = self._message_context.get(session_id)
-        if ctx and ctx.get("channel_name") == channel:
-            target = ctx["target"]
-        else:
-            target = ""
+        target = ctx["target"] if ctx and ctx.get("channel_name") == channel else ""
         return await chan_obj.send_file(target, file_path)
 
     # ------------------------------------------------------------------ #
