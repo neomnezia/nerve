@@ -322,6 +322,28 @@ class ChannelRouter:
         return True
 
     # ------------------------------------------------------------------ #
+    #  File delivery                                                        #
+    # ------------------------------------------------------------------ #
+
+    async def send_file(self, session_id: str, file_path: str) -> bool:
+        """Deliver a file to the chat associated with a session.
+
+        Returns True if the file was delivered, False if there is no
+        message context for the session, or the bound channel does not
+        declare SEND_FILES capability, or the channel-level send_file
+        returned False (size limit, missing file, transport error).
+        """
+        ctx = self._message_context.get(session_id)
+        if not ctx:
+            return False
+
+        channel = self._channels.get(ctx["channel_name"])
+        if not channel or ChannelCapability.SEND_FILES not in channel.capabilities:
+            return False
+
+        return await channel.send_file(ctx["target"], file_path)
+
+    # ------------------------------------------------------------------ #
     #  Interactive tool response routing                                    #
     # ------------------------------------------------------------------ #
 
