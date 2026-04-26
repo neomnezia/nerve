@@ -170,24 +170,31 @@ def _smart_split(text: str, limit: int = MAX_MSG_LEN) -> list[str]:
         chunks.append(current)
 
     chunks = _balance_code_fences(chunks)
-    # Defense: _balance_code_fences can prepend an opening fence
+    # Defense loop: _balance_code_fences can prepend an opening fence
     # (e.g. ```python\n) and append a closing fence (\n```), growing a
     # chunk beyond what was planned. Combined with the actual continuation
     # marker length (which depends on the final chunk count), some chunks
-    # could still overshoot Telegram's MAX_MSG_LEN cap. Validate against
-    # the *actual* marker overhead for the current chunk count and
-    # hard-cut any genuine overflow. We loop a few times because hard-cut
-    # may grow the chunk count enough to widen the marker (e.g. 99 → 100),
-    # which tightens the budget a little; the loop converges in ≤2 passes.
-    for _ in range(3):
+    # could still overshoot Telegram's MAX_MSG_LEN cap. We alternate
+    # ``_enforce_chunk_limit`` (hard-cuts overflow) with a re-balance pass
+    # because hard-cutting at raw character boundaries can split ``` fence
+    # markers across chunks. Re-balancing restores even fence counts; the
+    # cycle is bounded so even pathological inputs converge or fall back
+    # to whatever fits, never silently dropping content.
+    for _ in range(5):
         total = len(chunks)
         actual_marker_len = (
             len(f"({total}/{total})\n") if total > 1 else 0
         )
-        new_chunks = _enforce_chunk_limit(chunks, limit - actual_marker_len)
-        if len(new_chunks) == total:
+        cap = limit - actual_marker_len
+        if all(len(c) <= cap for c in chunks):
             break
-        chunks = new_chunks
+        chunks = _enforce_chunk_limit(chunks, cap)
+        # Re-balance after hard-cut: the slice may have split a ```
+        # fence marker, leaving an odd fence count in the resulting
+        # chunks. _balance_code_fences restores even counts and may
+        # marginally grow chunks, which is what the next iteration
+        # (or the size-cap check) accounts for.
+        chunks = _balance_code_fences(chunks)
     return _add_continuation_markers(chunks)
 
 
@@ -699,6 +706,16 @@ class TelegramChannel(BaseChannel):
             await self._send_as_file(chat_id, text)
             return
         # Otherwise, smart-split inline (fence-aware, hierarchical).
+        await self._send_inline_chunks(chat_id, text)
+
+    async def _send_inline_chunks(self, chat_id: int, text: str) -> None:
+        """Smart-split ``text`` and send each chunk inline with throttling.
+
+        Used for both the normal inline path and as the fallback delivery
+        path from :meth:`_send_as_file` when a document upload fails — so
+        a transient ``send_document`` error never causes total response
+        loss.
+        """
         chunks = _smart_split(text, limit=MAX_MSG_LEN)
         for chunk in chunks:
             html_chunk = _md_to_tg_html(chunk)
@@ -718,18 +735,13 @@ class TelegramChannel(BaseChannel):
             if len(chunks) > 1:
                 await asyncio.sleep(0.1)
 
-    async def _send_as_file(self, chat_id: int, text: str) -> None:
-        """Deliver an oversized response as ``response.md`` + 1-line summary.
+    def _build_file_summary(self, text: str) -> str:
+        """Build the HTML summary message that accompanies a file attachment.
 
-        Sent as two messages: a short inline summary (size + first line for
-        context) followed by the document attachment. The document carries
-        the full text in Markdown so the user can scroll, search, save, or
-        share without the chat history being flooded with chunks.
-
-        Only invoked from :meth:`send` when ``len(text) > FILE_ATTACH_THRESHOLD``.
+        Includes total size and a snippet of the first non-empty line so
+        the user has context without opening the document.
         """
         size_kb = len(text) / 1024
-        # Snippet for context — first non-empty line, capped.
         first_line = ""
         for line in text.splitlines():
             stripped = line.strip()
@@ -738,30 +750,26 @@ class TelegramChannel(BaseChannel):
                 break
         if len(first_line) > 160:
             first_line = first_line[:160] + "…"
-
         if first_line:
-            summary_html = (
+            return (
                 f"Response is {size_kb:.0f} KB — delivered as file.\n"
                 f"<i>{_html.escape(first_line)}</i>"
             )
-        else:
-            summary_html = f"Response is {size_kb:.0f} KB — delivered as file."
+        return f"Response is {size_kb:.0f} KB — delivered as file."
 
-        try:
-            sent = await self._app.bot.send_message(
-                chat_id=chat_id,
-                text=summary_html,
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            # Plain-text fallback if HTML parse fails.
-            sent = await self._app.bot.send_message(
-                chat_id=chat_id,
-                text=f"Response is {size_kb:.0f} KB — delivered as file.",
-            )
-        self._cache_message(sent.message_id, chat_id, summary_html)
+    async def _send_as_file(self, chat_id: int, text: str) -> None:
+        """Deliver an oversized response as ``response.md`` + 1-line summary.
 
-        # Send the full text as a Markdown attachment.
+        Order matters: the document is uploaded *first*. Only on a
+        successful upload do we send the inline summary — otherwise the
+        summary would falsely claim "delivered as file" while the file is
+        missing. On ``send_document`` failure (network blip, Telegram
+        rate limit, oversized file rejected), we fall back to inline
+        smart-split delivery via :meth:`_send_inline_chunks` so the
+        response is never silently lost.
+
+        Only invoked from :meth:`send` when ``len(text) > FILE_ATTACH_THRESHOLD``.
+        """
         bio = io.BytesIO(text.encode("utf-8"))
         bio.name = "response.md"
         try:
@@ -772,9 +780,30 @@ class TelegramChannel(BaseChannel):
             )
         except Exception as exc:
             logger.warning(
-                "_send_as_file: send_document failed for chat %d (%d bytes): %s",
+                "_send_as_file: send_document failed for chat %d (%d bytes), "
+                "falling back to inline smart-split: %s",
                 chat_id, len(text), exc,
             )
+            # Inline fallback so the user doesn't get a misleading
+            # "delivered as file" summary with no actual content.
+            await self._send_inline_chunks(chat_id, text)
+            return
+
+        # Document succeeded — send the short HTML summary as a follow-up.
+        summary_html = self._build_file_summary(text)
+        try:
+            sent = await self._app.bot.send_message(
+                chat_id=chat_id,
+                text=summary_html,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            # Plain-text fallback if HTML parse fails.
+            sent = await self._app.bot.send_message(
+                chat_id=chat_id,
+                text=f"Response is {len(text) / 1024:.0f} KB — delivered as file.",
+            )
+        self._cache_message(sent.message_id, chat_id, summary_html)
 
     def format_response(self, text: str) -> str:
         """Identity for Telegram — actual chunking happens in :meth:`send`.

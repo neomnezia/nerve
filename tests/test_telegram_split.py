@@ -249,3 +249,88 @@ def test_send_at_or_below_max_msg_len_sends_one_message():
     asyncio.run(channel.send(msg))
     assert channel._app.bot.send_message.await_count == 1
     assert channel._app.bot.send_document.await_count == 0
+
+
+# --------------------------------------------------------------------------- #
+#  Codex round-2 regression tests                                             #
+# --------------------------------------------------------------------------- #
+
+
+def test_send_document_failure_falls_back_to_inline_smart_split():
+    """Codex P1 (round 2): if `send_document` raises, the response must still
+    reach the user via inline smart-split. Otherwise users would only see a
+    misleading "delivered as file" summary with no actual content.
+    """
+    channel = _make_channel_with_mock_bot()
+    # Make send_document fail; send_message keeps working.
+    channel._app.bot.send_document = AsyncMock(side_effect=RuntimeError("boom"))
+    text = "a" * (FILE_ATTACH_THRESHOLD + 100)
+    msg = OutboundMessage(target="123", text=text)
+    asyncio.run(channel.send(msg))
+    # send_document was attempted exactly once.
+    assert channel._app.bot.send_document.await_count == 1
+    # Fallback: inline smart-split delivered the content as multiple messages.
+    # No misleading summary message — the chunks themselves are the delivery.
+    assert channel._app.bot.send_message.await_count >= 2
+    # Reassemble payload from the chunks (stripping continuation markers)
+    # and verify the body content survived.
+    import re
+    sent_texts = [
+        call.kwargs.get("text", "")
+        for call in channel._app.bot.send_message.await_args_list
+    ]
+    bodies = [re.sub(r"^\(\d+/\d+\)\n", "", t) for t in sent_texts]
+    rebuilt = "".join(bodies)
+    # The reconstruction may have minor join-character differences (e.g.
+    # paragraph boundaries are split-points), but every original char
+    # of the homogeneous payload must be present.
+    assert rebuilt.count("a") == text.count("a"), (
+        "fallback inline delivery lost content"
+    )
+
+
+def test_send_above_threshold_summary_arrives_after_document():
+    """Codex P1 (round 2) ordering: the document upload happens *before* the
+    summary, so a successful summary always reflects the file having
+    actually landed in chat (not a promise that the upload then breaks).
+    """
+    channel = _make_channel_with_mock_bot()
+    call_order: list[str] = []
+
+    async def track_doc(*args, **kwargs):
+        call_order.append("document")
+        return MagicMock(message_id=43)
+
+    async def track_msg(*args, **kwargs):
+        call_order.append("message")
+        return MagicMock(message_id=42)
+
+    channel._app.bot.send_document = AsyncMock(side_effect=track_doc)
+    channel._app.bot.send_message = AsyncMock(side_effect=track_msg)
+
+    text = "a" * (FILE_ATTACH_THRESHOLD + 1)
+    msg = OutboundMessage(target="123", text=text)
+    asyncio.run(channel.send(msg))
+    # Document goes first; summary message follows.
+    assert call_order == ["document", "message"], call_order
+
+
+def test_balanced_fences_after_hard_cut_when_overflow_forces_split():
+    """Codex P2 (round 2): when ``_enforce_chunk_limit`` hard-cuts a chunk
+    that contains a ``` fence marker, the slice can split the marker
+    across chunks, leaving an odd fence count. The smart-split loop
+    must re-run ``_balance_code_fences`` after each enforce pass so the
+    final chunks always have an even fence count and Telegram renders
+    code blocks correctly.
+    """
+    # Build content where the fenced block sits very close to the limit so
+    # the post-balance chunk overshoots and triggers _enforce_chunk_limit.
+    code_body = "x" * 4070
+    text = f"```python\n{code_body}\n```\n\nfollow-up paragraph that triggers split"
+    chunks = _smart_split(text, limit=MAX_MSG_LEN)
+    for i, chunk in enumerate(chunks):
+        body = _strip_continuation_prefix(chunk)
+        assert body.count("```") % 2 == 0, (
+            f"chunk {i} has odd fence count: {body[:80]!r}…{body[-40:]!r}"
+        )
+        assert len(chunk) <= MAX_MSG_LEN, f"chunk {i} oversized: {len(chunk)}"
