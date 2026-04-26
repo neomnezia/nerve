@@ -84,3 +84,27 @@ def test_single_word_longer_than_limit_hard_splits_with_warning(caplog):
     assert len(chunks) >= 3
     assert all(len(c) <= 4096 for c in chunks)
     assert any("hard split" in rec.message.lower() for rec in caplog.records)
+
+
+def test_code_fence_split_closes_and_reopens():
+    code_body = "line\n" * 1500  # ~7500 chars inside fence
+    text = f"intro paragraph\n\n```python\n{code_body}```"
+    chunks = _smart_split(text, limit=4096)
+    assert len(chunks) >= 2
+    # First chunk that opens a fence must close it before the boundary.
+    for chunk in chunks:
+        body = _strip_continuation_prefix(chunk)
+        # Count of ``` markers must be even — fences balanced per chunk.
+        assert body.count("```") % 2 == 0, f"unbalanced fence in chunk: {body[:80]!r}"
+
+
+def test_code_fence_with_language_tag_reopens_with_same_tag():
+    code_body = "x = 1\n" * 1000
+    text = f"```python\n{code_body}```"
+    chunks = _smart_split(text, limit=4096)
+    if len(chunks) >= 2:
+        second_body = _strip_continuation_prefix(chunks[1])
+        # Continuation chunk must reopen the fence with the original language tag.
+        assert second_body.startswith("```python\n"), (
+            f"expected reopened ```python fence, got: {second_body[:80]!r}"
+        )

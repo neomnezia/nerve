@@ -162,10 +162,40 @@ def _smart_split(text: str, limit: int = MAX_MSG_LEN) -> list[str]:
     if current:
         chunks.append(current)
 
+    chunks = _balance_code_fences(chunks)
     return _add_continuation_markers(chunks)
 
 
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
+_FENCE_RE = re.compile(r"^```([^\n]*)$", re.MULTILINE)
+
+
+def _balance_code_fences(chunks: list[str]) -> list[str]:
+    """Ensure every chunk has balanced ``` fences.
+
+    Walk each chunk; if it leaves a fence open (odd number of ``` markers),
+    append a closing ``` and remember the language tag of the last opening
+    fence so the next chunk can reopen it as ```<lang>.
+    """
+    if len(chunks) <= 1:
+        return chunks
+
+    out: list[str] = []
+    pending_lang: str | None = None
+    for chunk in chunks:
+        body = chunk
+        if pending_lang is not None:
+            body = f"```{pending_lang}\n{body}"
+            pending_lang = None
+
+        fences = _FENCE_RE.findall(body)
+        if len(fences) % 2 == 1:
+            # Last unmatched fence carries the language tag (may be empty).
+            pending_lang = fences[-1]
+            body = f"{body.rstrip()}\n```"
+
+        out.append(body)
+    return out
 
 
 def _split_paragraph(para: str, limit: int) -> list[str]:
