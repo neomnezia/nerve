@@ -325,23 +325,58 @@ class ChannelRouter:
     #  File delivery                                                        #
     # ------------------------------------------------------------------ #
 
-    async def send_file(self, session_id: str, file_path: str) -> bool:
+    async def send_file(
+        self,
+        session_id: str,
+        file_path: str,
+        channel: str | None = None,
+    ) -> bool:
         """Deliver a file to the chat associated with a session.
 
-        Returns True if the file was delivered, False if there is no
-        message context for the session, or the bound channel does not
-        declare SEND_FILES capability, or the channel-level send_file
-        returned False (size limit, missing file, transport error).
+        When ``channel`` is provided, dispatch is restricted to that
+        channel's ``send_file`` impl. This prevents cross-channel file
+        leakage when ``_message_context`` carries a stale entry from a
+        prior inbound channel (e.g. a Telegram-bound session that later
+        receives a web prompt — the agent must not deliver the file to
+        the Telegram chat just because that's what the cached context
+        points to). The cached target is only reused when the context
+        channel matches the requested ``channel``.
+
+        When ``channel`` is omitted, falls back to the most recent
+        inbound channel from ``_message_context`` (legacy behaviour,
+        preserved for callers that don't know the active channel).
+
+        Returns True if the file was delivered, False otherwise (no
+        context, missing channel, missing capability, channel-level
+        delivery failure).
         """
         ctx = self._message_context.get(session_id)
+
+        if channel is not None:
+            chan_obj = self._channels.get(channel)
+            if (
+                not chan_obj
+                or ChannelCapability.SEND_FILES not in chan_obj.capabilities
+            ):
+                return False
+            # Reuse cached target only when the context channel matches.
+            # Mismatched/missing context → empty target. Channels that
+            # require a real target (e.g. Telegram) will fail safely
+            # inside their own send_file impl; channels that don't need
+            # a target (e.g. web, broadcast-based) succeed regardless.
+            if ctx and ctx.get("channel_name") == channel:
+                target = ctx["target"]
+            else:
+                target = ""
+            return await chan_obj.send_file(target, file_path)
+
+        # Legacy path — no active channel known, use cached context.
         if not ctx:
             return False
-
-        channel = self._channels.get(ctx["channel_name"])
-        if not channel or ChannelCapability.SEND_FILES not in channel.capabilities:
+        chan_obj = self._channels.get(ctx["channel_name"])
+        if not chan_obj or ChannelCapability.SEND_FILES not in chan_obj.capabilities:
             return False
-
-        return await channel.send_file(ctx["target"], file_path)
+        return await chan_obj.send_file(ctx["target"], file_path)
 
     # ------------------------------------------------------------------ #
     #  Interactive tool response routing                                    #

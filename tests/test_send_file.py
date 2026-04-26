@@ -2,11 +2,13 @@
 
 Covers:
 - ChannelRouter.send_file fan-out: missing context, missing capability,
-  successful dispatch.
+  successful dispatch, and explicit-channel routing (cross-channel
+  leakage prevention).
 - TelegramChannel.send_file: missing file, oversized file, success path.
 - _send_file_impl in agent.tools: workspace scope, engine-unavailable
   fallback, native-delivered success message, fallback message when
-  the channel cannot deliver.
+  the channel cannot deliver, active-channel propagation.
+- AgentEngine.get_active_channel: accessor reflects internal state.
 """
 
 from __future__ import annotations
@@ -125,6 +127,116 @@ class TestRouterSendFile:
         f = tmp_path / "a.txt"
         f.write_text("hi")
         assert await router.send_file("sess-1", str(f)) is False
+
+    # ---- Cross-channel safety (explicit ``channel`` arg) ------------- #
+
+    async def test_explicit_channel_overrides_stale_context(self, tmp_path):
+        """Stale Telegram ctx must NOT leak to Telegram when caller asks for web.
+
+        Reproduces the cross-channel leakage path: a session previously
+        received a Telegram message (so router._message_context points
+        at a Telegram chat), and is now being driven by a web prompt.
+        send_file with channel="web" must dispatch to the web channel,
+        never to the Telegram chat.
+        """
+        engine = MagicMock()
+        router = ChannelRouter(engine)
+        telegram_stub = _StubChannel(
+            name="telegram",
+            caps=ChannelCapability.SEND_TEXT | ChannelCapability.SEND_FILES,
+        )
+        web_stub = _StubChannel(
+            name="web",
+            caps=ChannelCapability.SEND_TEXT | ChannelCapability.SEND_FILES,
+        )
+        router._channels["telegram"] = telegram_stub
+        router._channels["web"] = web_stub
+        # Stale context from a prior Telegram inbound message.
+        router._message_context["sess-1"] = {
+            "channel_name": "telegram",
+            "target": "999",
+            "message_id": 1,
+        }
+        f = tmp_path / "a.txt"
+        f.write_text("hi")
+
+        ok = await router.send_file("sess-1", str(f), channel="web")
+        assert ok is True
+        # Telegram MUST NOT have been called — that would leak the file.
+        assert telegram_stub.send_file_calls == []
+        # Web received the dispatch (target irrelevant for web).
+        assert len(web_stub.send_file_calls) == 1
+        assert web_stub.send_file_calls[0][1] == str(f)
+
+    async def test_explicit_channel_uses_cached_target_when_match(self, tmp_path):
+        """When channel arg matches cached ctx, reuse the cached target."""
+        engine = MagicMock()
+        router = ChannelRouter(engine)
+        telegram_stub = _StubChannel(
+            name="telegram",
+            caps=ChannelCapability.SEND_TEXT | ChannelCapability.SEND_FILES,
+        )
+        router._channels["telegram"] = telegram_stub
+        router._message_context["sess-1"] = {
+            "channel_name": "telegram",
+            "target": "12345",
+            "message_id": 1,
+        }
+        f = tmp_path / "a.txt"
+        f.write_text("hi")
+
+        ok = await router.send_file("sess-1", str(f), channel="telegram")
+        assert ok is True
+        assert telegram_stub.send_file_calls == [("12345", str(f))]
+
+    async def test_explicit_channel_empty_target_when_no_match(self, tmp_path):
+        """No matching context → empty target. Channels needing a real
+        target (Telegram) should fail safely; broadcast channels (web)
+        succeed regardless.
+        """
+        engine = MagicMock()
+        router = ChannelRouter(engine)
+        # Channel that records target — verify it's empty.
+        telegram_stub = _StubChannel(
+            name="telegram",
+            caps=ChannelCapability.SEND_TEXT | ChannelCapability.SEND_FILES,
+            send_file_returns=False,  # Real Telegram would fail on int("")
+        )
+        router._channels["telegram"] = telegram_stub
+        # Context points at a different channel.
+        router._message_context["sess-1"] = {
+            "channel_name": "web",
+            "target": "client-abc",
+            "message_id": 1,
+        }
+        f = tmp_path / "a.txt"
+        f.write_text("hi")
+
+        ok = await router.send_file("sess-1", str(f), channel="telegram")
+        assert ok is False
+        # Called with empty target — no leak of cached "client-abc".
+        assert telegram_stub.send_file_calls == [("", str(f))]
+
+    async def test_explicit_channel_unknown_returns_false(self, tmp_path):
+        engine = MagicMock()
+        router = ChannelRouter(engine)
+        f = tmp_path / "a.txt"
+        f.write_text("hi")
+        assert await router.send_file(
+            "sess-1", str(f), channel="nonexistent",
+        ) is False
+
+    async def test_explicit_channel_without_capability_returns_false(self, tmp_path):
+        engine = MagicMock()
+        router = ChannelRouter(engine)
+        ch = _StubChannel(name="text-only", caps=ChannelCapability.SEND_TEXT)
+        router._channels["text-only"] = ch
+        f = tmp_path / "a.txt"
+        f.write_text("hi")
+        assert await router.send_file(
+            "sess-1", str(f), channel="text-only",
+        ) is False
+        assert ch.send_file_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +382,7 @@ class TestSendFileImpl:
         f.write_text("hi")
 
         engine = MagicMock()
+        engine.get_active_channel = MagicMock(return_value="telegram")
         engine.router = MagicMock()
         engine.router.send_file = AsyncMock(return_value=True)
 
@@ -280,7 +393,7 @@ class TestSendFileImpl:
             )
 
         engine.router.send_file.assert_awaited_once_with(
-            "sess-1", str(f.resolve())
+            "sess-1", str(f.resolve()), channel="telegram",
         )
         text = result["content"][0]["text"]
         assert text.startswith("Sent file: a.txt")
@@ -294,6 +407,7 @@ class TestSendFileImpl:
         f.write_text("hi")
 
         engine = MagicMock()
+        engine.get_active_channel = MagicMock(return_value="telegram")
         engine.router = MagicMock()
         engine.router.send_file = AsyncMock(return_value=False)
 
@@ -315,6 +429,7 @@ class TestSendFileImpl:
         f.write_text("hi")
 
         engine = MagicMock()
+        engine.get_active_channel = MagicMock(return_value="web")
         engine.router = MagicMock()
         engine.router.send_file = AsyncMock(side_effect=RuntimeError("boom"))
 
@@ -326,3 +441,90 @@ class TestSendFileImpl:
         text = result["content"][0]["text"]
         assert "File ready: a.txt" in text
         assert "open the web panel" in text
+
+    async def test_active_channel_passed_through_to_router(self, tmp_path):
+        """_send_file_impl must read engine.get_active_channel and pass it
+        as the ``channel`` kwarg to router.send_file. This is what
+        prevents cross-channel leakage when ``_message_context`` is
+        stale.
+        """
+        from nerve.agent import tools
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        f = workspace / "a.txt"
+        f.write_text("hi")
+
+        engine = MagicMock()
+        engine.get_active_channel = MagicMock(return_value="web")
+        engine.router = MagicMock()
+        engine.router.send_file = AsyncMock(return_value=True)
+
+        with patch.object(tools, "_workspace", workspace), \
+             patch.object(tools, "_engine", engine):
+            await tools._send_file_impl(
+                {"file_path": str(f)}, "sess-1"
+            )
+
+        engine.get_active_channel.assert_called_once_with("sess-1")
+        engine.router.send_file.assert_awaited_once_with(
+            "sess-1", str(f.resolve()), channel="web",
+        )
+
+    async def test_no_active_channel_passes_none(self, tmp_path):
+        """When no channel is active (e.g. cron sessions before any
+        inbound message), send_file falls back to the legacy lookup —
+        but channel=None is still explicitly passed.
+        """
+        from nerve.agent import tools
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        f = workspace / "a.txt"
+        f.write_text("hi")
+
+        engine = MagicMock()
+        engine.get_active_channel = MagicMock(return_value=None)
+        engine.router = MagicMock()
+        engine.router.send_file = AsyncMock(return_value=False)
+
+        with patch.object(tools, "_workspace", workspace), \
+             patch.object(tools, "_engine", engine):
+            await tools._send_file_impl(
+                {"file_path": str(f)}, "sess-1"
+            )
+
+        engine.router.send_file.assert_awaited_once_with(
+            "sess-1", str(f.resolve()), channel=None,
+        )
+
+
+# ---------------------------------------------------------------------------
+# AgentEngine.get_active_channel
+# ---------------------------------------------------------------------------
+
+
+class TestEngineActiveChannel:
+    """Smoke tests for the per-session active-channel accessor.
+
+    The accessor is read by ``_send_file_impl`` to prevent stale
+    ``_message_context`` entries from misrouting files. We verify the
+    bookkeeping shape directly — driving a full engine.run() requires a
+    heavy fixture and is covered by integration smoke tests.
+    """
+
+    def test_get_returns_none_when_unset(self):
+        from nerve.agent.engine import AgentEngine
+
+        # Build a bare instance without running __init__ (no DB required).
+        engine = AgentEngine.__new__(AgentEngine)
+        engine._active_channel = {}
+        assert engine.get_active_channel("sess-1") is None
+
+    def test_get_returns_set_value(self):
+        from nerve.agent.engine import AgentEngine
+
+        engine = AgentEngine.__new__(AgentEngine)
+        engine._active_channel = {"sess-1": "telegram"}
+        assert engine.get_active_channel("sess-1") == "telegram"
+        assert engine.get_active_channel("sess-other") is None

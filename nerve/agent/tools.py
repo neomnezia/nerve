@@ -1768,7 +1768,15 @@ async def _send_file_impl(args: dict, session_id: str) -> dict:
     delivered = False
     if _engine is not None:
         try:
-            delivered = await _engine.router.send_file(session_id, str(resolved))
+            # Pass the active channel so the router does NOT fall back to
+            # ``_message_context`` when the entry is stale (e.g. a session
+            # that previously received a Telegram message and is now
+            # being driven by a web prompt — without this, the file would
+            # leak to the Telegram chat instead of the current requester).
+            active_channel = _engine.get_active_channel(session_id)
+            delivered = await _engine.router.send_file(
+                session_id, str(resolved), channel=active_channel,
+            )
         except Exception as e:
             logger.error("send_file dispatch failed: %s", e)
             delivered = False
