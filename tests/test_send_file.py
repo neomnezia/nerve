@@ -73,15 +73,43 @@ class _StubChannel(BaseChannel):
 
 @pytest.mark.asyncio
 class TestRouterSendFile:
-    async def test_no_message_context_returns_false(self):
+    async def test_no_channel_arg_returns_false_no_context(self):
+        """No active channel + no message context → False."""
         engine = MagicMock()
         router = ChannelRouter(engine)
         assert await router.send_file("missing-session", "/tmp/x") is False
 
+    async def test_no_channel_arg_refuses_even_with_context(self, tmp_path):
+        """Channel=None refuses delivery even when ``_message_context``
+        has a valid entry. This is the cross-channel leakage guard for
+        cron/planner sessions that don't pass a channel through
+        ``engine.run()`` — Codex P1 review on commit 28454ab.
+        """
+        engine = MagicMock()
+        router = ChannelRouter(engine)
+        ch = _StubChannel(
+            name="telegram",
+            caps=ChannelCapability.SEND_TEXT | ChannelCapability.SEND_FILES,
+        )
+        router._channels["telegram"] = ch
+        # Stale context pointing at a Telegram chat.
+        router._message_context["sess-1"] = {
+            "channel_name": "telegram",
+            "target": "999",
+            "message_id": 1,
+        }
+        f = tmp_path / "a.txt"
+        f.write_text("hi")
+        # Without an explicit ``channel`` arg the router MUST NOT
+        # dispatch via the cached context — otherwise cron/planner runs
+        # would leak files to that Telegram chat.
+        assert await router.send_file("sess-1", str(f)) is False
+        assert ch.send_file_calls == []
+
     async def test_channel_without_capability_returns_false(self, tmp_path):
         engine = MagicMock()
         router = ChannelRouter(engine)
-        ch = _StubChannel(caps=ChannelCapability.SEND_TEXT)
+        ch = _StubChannel(name="stub", caps=ChannelCapability.SEND_TEXT)
         router._channels["stub"] = ch
         router._message_context["sess-1"] = {
             "channel_name": "stub",
@@ -90,13 +118,14 @@ class TestRouterSendFile:
         }
         f = tmp_path / "a.txt"
         f.write_text("hi")
-        assert await router.send_file("sess-1", str(f)) is False
+        assert await router.send_file("sess-1", str(f), channel="stub") is False
         assert ch.send_file_calls == []
 
     async def test_dispatches_when_capability_present(self, tmp_path):
         engine = MagicMock()
         router = ChannelRouter(engine)
         ch = _StubChannel(
+            name="stub",
             caps=ChannelCapability.SEND_TEXT | ChannelCapability.SEND_FILES,
             send_file_returns=True,
         )
@@ -108,13 +137,14 @@ class TestRouterSendFile:
         }
         f = tmp_path / "a.txt"
         f.write_text("hi")
-        assert await router.send_file("sess-1", str(f)) is True
+        assert await router.send_file("sess-1", str(f), channel="stub") is True
         assert ch.send_file_calls == [("12345", str(f))]
 
     async def test_propagates_channel_failure(self, tmp_path):
         engine = MagicMock()
         router = ChannelRouter(engine)
         ch = _StubChannel(
+            name="stub",
             caps=ChannelCapability.SEND_TEXT | ChannelCapability.SEND_FILES,
             send_file_returns=False,
         )
@@ -126,7 +156,8 @@ class TestRouterSendFile:
         }
         f = tmp_path / "a.txt"
         f.write_text("hi")
-        assert await router.send_file("sess-1", str(f)) is False
+        assert await router.send_file("sess-1", str(f), channel="stub") is False
+        assert ch.send_file_calls == [("12345", str(f))]
 
     # ---- Cross-channel safety (explicit ``channel`` arg) ------------- #
 
