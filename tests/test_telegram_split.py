@@ -49,3 +49,38 @@ def _continuation_prefix(chunk: str) -> str:
 
 def _strip_continuation_prefix(chunk: str) -> str:
     return chunk[len(_continuation_prefix(chunk)):]
+
+
+def test_oversized_paragraph_splits_on_lines():
+    line = "x" * 1000
+    para = "\n".join([line] * 6)  # 6 * 1000 + 5 = 6005 chars
+    chunks = _smart_split(para, limit=4096)
+    # First chunk: ~4 lines (4 * 1000 + 3 = 4003) fits under 4088 inner_limit
+    assert len(chunks) >= 2
+    assert all(len(c) <= 4096 for c in chunks)
+    # No line is split mid-line
+    for chunk in chunks:
+        body = _strip_continuation_prefix(chunk)
+        for produced_line in body.split("\n"):
+            assert len(produced_line) == 1000 or produced_line == ""
+
+
+def test_oversized_line_splits_on_sentences():
+    sentence = "Lorem ipsum dolor sit amet. " * 200  # ~5600 chars, single line
+    chunks = _smart_split(sentence, limit=4096)
+    assert len(chunks) >= 2
+    assert all(len(c) <= 4096 for c in chunks)
+    # Each chunk body ends on a sentence terminator (or is the last chunk)
+    for chunk in chunks[:-1]:
+        body = _strip_continuation_prefix(chunk).rstrip()
+        assert body.endswith((".", "!", "?"))
+
+
+def test_single_word_longer_than_limit_hard_splits_with_warning(caplog):
+    import logging
+    monster = "x" * 10000
+    with caplog.at_level(logging.WARNING, logger="nerve.channels.telegram"):
+        chunks = _smart_split(monster, limit=4096)
+    assert len(chunks) >= 3
+    assert all(len(c) <= 4096 for c in chunks)
+    assert any("hard split" in rec.message.lower() for rec in caplog.records)

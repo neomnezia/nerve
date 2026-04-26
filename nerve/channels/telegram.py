@@ -165,9 +165,56 @@ def _smart_split(text: str, limit: int = MAX_MSG_LEN) -> list[str]:
     return _add_continuation_markers(chunks)
 
 
+_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
+
+
 def _split_paragraph(para: str, limit: int) -> list[str]:
-    """Stub — replaced in Task 2. For now: hard char split."""
-    return [para[i:i + limit] for i in range(0, len(para), limit)]
+    """Split a paragraph that exceeds ``limit`` using line → sentence → char."""
+    # Try line-level greedy packing first.
+    lines = para.split("\n")
+    if all(len(line) <= limit for line in lines):
+        return _greedy_join(lines, limit, sep="\n")
+
+    # Some line is too long — split each oversized line by sentences.
+    pieces: list[str] = []
+    for line in lines:
+        if len(line) <= limit:
+            pieces.append(line)
+        else:
+            pieces.extend(_split_long_line(line, limit))
+    return _greedy_join(pieces, limit, sep="\n")
+
+
+def _split_long_line(line: str, limit: int) -> list[str]:
+    """Split a single line by sentence boundaries; hard-cut if no boundaries help."""
+    sentences = _SENTENCE_RE.split(line)
+    if len(sentences) > 1 and all(len(s) <= limit for s in sentences):
+        # Re-attach the whitespace consumed by the regex split as a single space.
+        return _greedy_join(sentences, limit, sep=" ")
+
+    # No useful sentence boundaries — fall back to hard char cut.
+    logger.warning(
+        "telegram: hard split of %d-char run with no whitespace anchor",
+        len(line),
+    )
+    return [line[i:i + limit] for i in range(0, len(line), limit)]
+
+
+def _greedy_join(parts: list[str], limit: int, *, sep: str) -> list[str]:
+    """Greedily concatenate ``parts`` with ``sep`` so each result fits ``limit``."""
+    out: list[str] = []
+    current = ""
+    for part in parts:
+        candidate = f"{current}{sep}{part}" if current else part
+        if len(candidate) <= limit:
+            current = candidate
+        else:
+            if current:
+                out.append(current)
+            current = part
+    if current:
+        out.append(current)
+    return out
 
 
 def _add_continuation_markers(chunks: list[str]) -> list[str]:
