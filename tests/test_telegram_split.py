@@ -633,3 +633,65 @@ def test_long_line_preserves_inter_sentence_whitespace():
         "verbatim, not be normalized to a single space"
     )
     assert all(len(c) <= MAX_MSG_LEN for c in chunks)
+
+
+def test_oversized_paragraph_preserves_leading_blank_lines():
+    """Codex P2 (round 9, #1): an oversized paragraph beginning with a
+    blank-line run used to lose its leading newline because
+    ``_greedy_join`` silently dropped empty parts when seeding ``current``
+    via truthiness. Inputs like ``"short\\n\\n\\n" + long_paragraph``
+    therefore collapsed ``\\n\\n\\n`` to ``\\n\\n`` after reassembly,
+    mutating Markdown structure.
+
+    Repro: a leading short paragraph followed by triple-newline (one
+    extra blank line) into a long body. After splitting and stripping
+    continuation markers, the joined chunks must equal the input
+    verbatim.
+    """
+    short = "short paragraph"
+    long_body = "L" * 5000  # well over MAX_MSG_LEN
+    # ``\n\n\n`` between them: text.split("\n\n") yields
+    # ["short paragraph", "\n" + long_body] — the oversized branch then
+    # calls _split_paragraph("\n" + long_body, ...) whose lines list is
+    # ["", long_body], exercising the empty-leading-line case.
+    text = f"{short}\n\n\n{long_body}"
+
+    chunks = _smart_split(text, limit=MAX_MSG_LEN)
+    rebuilt = "".join(_strip_continuation_prefix(c) for c in chunks)
+    assert rebuilt == text, (
+        f"leading blank line lost: in[:30]={text[:30]!r}, "
+        f"out[:30]={rebuilt[:30]!r}, len_diff={len(rebuilt) - len(text)}"
+    )
+    assert all(len(c) <= MAX_MSG_LEN for c in chunks)
+
+
+def test_balance_code_fences_does_not_strip_trailing_whitespace():
+    """Codex P2 (round 9, #2): the closing-fence path used
+    ``f"{body.rstrip()}\\n```"`` which silently dropped trailing spaces
+    and blank lines from the chunk body before appending the closing
+    fence. For whitespace-significant content (Python blocks ending with
+    a blank line, code with intentional trailing spaces, ASCII tables)
+    that mutated user content. The fix appends the closing fence on a
+    fresh line without touching existing whitespace.
+    """
+    from nerve.channels.telegram import _balance_code_fences
+
+    # Case 1: body has trailing spaces *and* a trailing blank line.
+    body_with_trailing_blanks = "```python\nx = 1   \n  \n"
+    chunks = [body_with_trailing_blanks, "more\n```"]
+    out = _balance_code_fences(chunks)
+    assert out[0].startswith(body_with_trailing_blanks), (
+        f"body whitespace lost before fence close: {out[0]!r}"
+    )
+    assert out[0].endswith("```"), "chunk must end with closing fence"
+
+    # Case 2: body ends with content (no trailing newline) — fence
+    # balancer must add ``\n```` so the closing fence is on its own
+    # line, but must not strip any of the body's trailing characters.
+    body_no_trailing_nl = "```python\ndef foo():    "
+    chunks = [body_no_trailing_nl, "    return 1\n```"]
+    out = _balance_code_fences(chunks)
+    assert out[0].startswith(body_no_trailing_nl), (
+        f"body trailing spaces stripped: {out[0]!r}"
+    )
+    assert out[0].endswith("\n```"), "fence must be opened on a new line"

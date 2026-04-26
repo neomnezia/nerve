@@ -295,27 +295,63 @@ def _balance_code_fences(chunks: list[str]) -> list[str]:
         if len(fences) % 2 == 1:
             # Last unmatched fence carries the language tag (may be empty).
             pending_lang = fences[-1]
-            body = f"{body.rstrip()}\n```"
+            # Codex P2 (round 9): the previous closing path used
+            # ``body.rstrip()`` to normalize whitespace before appending
+            # ``\n```` — but for whitespace-significant code (e.g. Python
+            # blocks, ASCII tables, trailing-blank-line snippets) that
+            # silently dropped trailing spaces and blank lines from the
+            # chunk content. Append the closing fence on a fresh line
+            # without mutating any existing whitespace; if ``body``
+            # already ends in ``\n`` we reuse it, otherwise we add one.
+            if body.endswith("\n"):
+                body = f"{body}```"
+            else:
+                body = f"{body}\n```"
 
         out.append(body)
     return out
 
 
 def _split_paragraph(para: str, limit: int) -> list[str]:
-    """Split a paragraph that exceeds ``limit`` using line → sentence → char."""
-    # Try line-level greedy packing first.
+    """Split a paragraph that exceeds ``limit`` using line → sentence → char.
+
+    Codex P2 (round 9, #1): the previous implementation passed the line
+    list to ``_greedy_join(..., sep="\\n")``, which inserts ``\\n`` only
+    *within* a packed chunk. At chunk boundaries the separator was lost,
+    and any leading empty line in ``lines`` was silently dropped by the
+    truthiness-based seeding inside ``_greedy_join``. Both regressions
+    mutated content (collapsing blank-line runs).
+
+    The fix promotes the ``\\n`` separators between original lines to
+    first-class atoms, so concatenating the produced chunks reproduces
+    the paragraph exactly. Hard-cut sub-chunks emitted by
+    ``_split_long_line`` are concatenated without an inserted separator
+    (they were originally one continuous line), preserving the
+    no-anchor partition contract.
+    """
     lines = para.split("\n")
     if all(len(line) <= limit for line in lines):
-        return _greedy_join(lines, limit, sep="\n")
+        # Atomize lines: ``\n`` separators between original lines, lines
+        # themselves as content atoms (empty lines included).
+        atoms: list[str] = []
+        for i, line in enumerate(lines):
+            if i > 0:
+                atoms.append("\n")
+            atoms.append(line)
+        return _greedy_join(atoms, limit, sep="")
 
-    # Some line is too long — split each oversized line by sentences.
+    # Mixed: some lines fit, some need finer splitting. Same atom
+    # structure with the long lines expanded into their sub-chunks (no
+    # internal separator — those sub-chunks were one logical line).
     pieces: list[str] = []
-    for line in lines:
+    for i, line in enumerate(lines):
+        if i > 0:
+            pieces.append("\n")
         if len(line) <= limit:
             pieces.append(line)
         else:
             pieces.extend(_split_long_line(line, limit))
-    return _greedy_join(pieces, limit, sep="\n")
+    return _greedy_join(pieces, limit, sep="")
 
 
 def _split_long_line(line: str, limit: int) -> list[str]:
@@ -360,18 +396,30 @@ def _split_long_line(line: str, limit: int) -> list[str]:
 
 
 def _greedy_join(parts: list[str], limit: int, *, sep: str) -> list[str]:
-    """Greedily concatenate ``parts`` with ``sep`` so each result fits ``limit``."""
+    """Greedily concatenate ``parts`` with ``sep`` so each result fits ``limit``.
+
+    Codex P2 (round 9): the previous implementation used truthiness checks
+    on ``current`` to decide whether to seed/flush, which silently dropped
+    legitimately empty parts. For an oversized paragraph beginning with a
+    blank-line run (``"\\n" * k + long_line``), ``para.split("\\n")``
+    yields ``["", "", ..., long_line]`` and the leading ``""`` entries were
+    discarded — collapsing ``\\n\\n\\nlong`` to ``\\nlong`` after
+    reassembly. Use a ``None`` sentinel so empty parts are preserved as
+    first-class content.
+    """
     out: list[str] = []
-    current = ""
+    current: str | None = None
     for part in parts:
-        candidate = f"{current}{sep}{part}" if current else part
+        if current is None:
+            current = part
+            continue
+        candidate = f"{current}{sep}{part}"
         if len(candidate) <= limit:
             current = candidate
         else:
-            if current:
-                out.append(current)
+            out.append(current)
             current = part
-    if current:
+    if current is not None:
         out.append(current)
     return out
 
