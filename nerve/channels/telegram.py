@@ -269,7 +269,7 @@ def _smart_split(text: str, limit: int = MAX_MSG_LEN) -> list[str]:
     return _add_continuation_markers(chunks)
 
 
-_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
+_SENTENCE_RE = re.compile(r"(?<=[.!?])(\s+)")
 _FENCE_RE = re.compile(r"^```([^\n]*)$", re.MULTILINE)
 
 
@@ -319,11 +319,37 @@ def _split_paragraph(para: str, limit: int) -> list[str]:
 
 
 def _split_long_line(line: str, limit: int) -> list[str]:
-    """Split a single line by sentence boundaries; hard-cut if no boundaries help."""
-    sentences = _SENTENCE_RE.split(line)
-    if len(sentences) > 1 and all(len(s) <= limit for s in sentences):
-        # Re-attach the whitespace consumed by the regex split as a single space.
-        return _greedy_join(sentences, limit, sep=" ")
+    """Split a single line by sentence boundaries; hard-cut if no boundaries help.
+
+    Codex P2 (round 8): the previous implementation used
+    ``_SENTENCE_RE.split(line)`` (no capture group), which consumed the
+    whitespace separator between sentences and then rejoined with a single
+    space — silently normalizing tabs, multiple spaces, or other layout
+    whitespace in plain-text payloads. The regex now captures the
+    separator so it can be carried through the split and reattached
+    verbatim, making the splitter a faithful partition rather than a
+    mutation of content.
+    """
+    # ``re.split`` with one capture group returns alternating
+    # ``[text, sep, text, sep, ..., text]`` (always odd length when there
+    # is at least one match).
+    parts = _SENTENCE_RE.split(line)
+    if len(parts) > 1:
+        sentences = parts[::2]
+        seps = parts[1::2]
+        # Pair each sentence with its trailing whitespace separator so
+        # ``_greedy_join(..., sep="")`` reproduces the original spacing
+        # exactly. The final sentence has no trailing separator.
+        atoms: list[str] = [
+            s + (seps[i] if i < len(seps) else "")
+            for i, s in enumerate(sentences)
+        ]
+        # Drop empty atoms that arise from leading/trailing separators
+        # (e.g. ``"foo.   "`` → atoms ``["foo.   ", ""]``); they carry no
+        # content and would otherwise force an extra greedy-join pass.
+        atoms = [a for a in atoms if a]
+        if atoms and all(len(a) <= limit for a in atoms):
+            return _greedy_join(atoms, limit, sep="")
 
     # No useful sentence boundaries — fall back to hard char cut.
     logger.warning(

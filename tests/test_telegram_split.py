@@ -598,3 +598,38 @@ def test_whitespace_only_payload_is_not_silently_dropped():
     )
     # Each chunk fits the cap.
     assert all(len(c) <= MAX_MSG_LEN for c in chunks)
+
+
+def test_long_line_preserves_inter_sentence_whitespace():
+    """Codex P2 (round 8): ``_split_long_line`` previously used a
+    non-capturing ``_SENTENCE_RE.split`` and rejoined sentences with a
+    single space, silently normalizing aligned-text layouts (multiple
+    spaces, tabs) found in CLI output, ASCII tables, etc. The fix
+    captures the separator so reassembly reproduces the input verbatim.
+
+    Repro: a single line longer than the limit composed of sentences
+    separated by varied whitespace runs (\\t, multiple spaces). After
+    splitting, concatenating the (marker-stripped) chunks must equal
+    the original input.
+    """
+    # 4 sentences × ~1500 chars each = ~6000 chars on one line, well over
+    # MAX_MSG_LEN, forcing ``_split_long_line`` to pick sentence anchors.
+    sentences = [
+        "Alpha." + ("a" * 1500),
+        "Bravo!" + ("b" * 1500),
+        "Charlie?" + ("c" * 1500),
+        "Delta." + ("d" * 1500),
+    ]
+    # Distinct separators between each pair to detect normalization.
+    seps = ["   ", "\t\t", " \t "]
+    line = sentences[0] + seps[0] + sentences[1] + seps[1] + sentences[2] + seps[2] + sentences[3]
+
+    chunks = _smart_split(line, limit=MAX_MSG_LEN)
+    assert len(chunks) > 1, "test input must exceed MAX_MSG_LEN to exercise splitter"
+
+    rebuilt = "".join(_strip_continuation_prefix(c) for c in chunks)
+    assert rebuilt == line, (
+        "splitter mutated whitespace: inter-sentence spacing must round-trip "
+        "verbatim, not be normalized to a single space"
+    )
+    assert all(len(c) <= MAX_MSG_LEN for c in chunks)
