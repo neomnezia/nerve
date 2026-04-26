@@ -1,6 +1,15 @@
 """Unit tests for nerve.channels.telegram._smart_split."""
 
-from nerve.channels.telegram import _smart_split, MAX_MSG_LEN
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
+
+from nerve.channels.base import OutboundMessage
+from nerve.channels.telegram import (
+    FILE_ATTACH_THRESHOLD,
+    MAX_MSG_LEN,
+    TelegramChannel,
+    _smart_split,
+)
 
 
 def test_short_text_returns_single_chunk_unchanged():
@@ -124,3 +133,119 @@ def test_format_response_no_longer_truncates():
     # No "(truncated)" suffix; full payload preserved.
     assert "(truncated)" not in out
     assert out == long_text
+
+
+# --------------------------------------------------------------------------- #
+#  V6 regression tests (PR #3 review fixes + file-attach routing)             #
+# --------------------------------------------------------------------------- #
+
+
+def test_chunks_under_limit_after_fence_balance_grows_them():
+    """P1 (Codex): _balance_code_fences may prepend ```python and append ```,
+    pushing a chunk over MAX_MSG_LEN. _enforce_chunk_limit must hard-cut the
+    overflow before continuation markers are added.
+    """
+    # Construct a fenced block right at the boundary so fence prefix/suffix
+    # additions force a re-split.
+    code_body = "x" * 4000  # leaves <100 chars for fence + marker overhead
+    text = f"```python\n{code_body}\n```\n\nmore text here that triggers split"
+    chunks = _smart_split(text, limit=MAX_MSG_LEN)
+    # Every produced chunk MUST fit Telegram's hard cap, even after fences
+    # were rebalanced and continuation markers prepended.
+    assert all(len(c) <= MAX_MSG_LEN for c in chunks), [len(c) for c in chunks]
+
+
+def test_continuation_marker_overhead_handles_three_digit_counts():
+    """P2 (Codex): the original code reserved 8 chars for "(99/99)\\n" but
+    never enforced that ceiling. Build a payload that produces ≥100 chunks
+    and verify every chunk still fits MAX_MSG_LEN once "(NNN/MMM)\\n" is
+    prepended.
+    """
+    # Each line is ~3900 chars, packed via paragraph splitter into one chunk
+    # apiece. 105 lines → 105 chunks → markers like "(105/105)\n" (10 chars).
+    big_para = "z" * 3900
+    text = "\n\n".join([big_para] * 105)
+    chunks = _smart_split(text, limit=MAX_MSG_LEN)
+    assert len(chunks) >= 100, f"expected ≥100 chunks, got {len(chunks)}"
+    over = [(i, len(c)) for i, c in enumerate(chunks) if len(c) > MAX_MSG_LEN]
+    assert not over, f"chunks exceeding MAX_MSG_LEN: {over[:5]}"
+
+
+def test_file_attach_threshold_constant_is_sane():
+    """V6: threshold must be above MAX_MSG_LEN (otherwise short messages
+    would trigger file-attach) and well below Telegram's 50 MiB document cap.
+    """
+    assert FILE_ATTACH_THRESHOLD > MAX_MSG_LEN
+    assert FILE_ATTACH_THRESHOLD < 50 * 1024 * 1024
+
+
+def _make_channel_with_mock_bot():
+    """Build a TelegramChannel whose ._app.bot is an AsyncMock."""
+    channel = TelegramChannel.__new__(TelegramChannel)
+    channel._app = MagicMock()
+    channel._app.bot = MagicMock()
+    channel._app.bot.send_message = AsyncMock(
+        return_value=MagicMock(message_id=42),
+    )
+    channel._app.bot.send_document = AsyncMock(
+        return_value=MagicMock(message_id=43),
+    )
+    # Bypass cache machinery used by send().
+    channel._cache_message = MagicMock()
+    return channel
+
+
+def test_send_below_threshold_uses_inline_path():
+    """V6: a 5 KB response (above MAX_MSG_LEN, below FILE_ATTACH_THRESHOLD)
+    should be smart-split inline — no document attachment.
+    """
+    channel = _make_channel_with_mock_bot()
+    text = "a" * 5000  # 5 KB, between MAX_MSG_LEN (4 KB) and FILE_ATTACH_THRESHOLD (20 KB)
+    msg = OutboundMessage(target="123", text=text)
+    asyncio.run(channel.send(msg))
+    assert channel._app.bot.send_message.await_count >= 2  # at least 2 chunks
+    assert channel._app.bot.send_document.await_count == 0
+
+
+def test_send_above_threshold_uses_file_attach_path():
+    """V6: above FILE_ATTACH_THRESHOLD, send must deliver a summary message
+    plus exactly one document attachment — never spam-chunk the chat.
+    """
+    channel = _make_channel_with_mock_bot()
+    text = "a" * (FILE_ATTACH_THRESHOLD + 1)
+    msg = OutboundMessage(target="123", text=text)
+    asyncio.run(channel.send(msg))
+    # Exactly one summary message and exactly one document.
+    assert channel._app.bot.send_message.await_count == 1
+    assert channel._app.bot.send_document.await_count == 1
+    # Document payload contains the full text (round-trip via BytesIO).
+    doc_call = channel._app.bot.send_document.await_args
+    bio = doc_call.kwargs["document"]
+    bio.seek(0)
+    assert bio.read().decode("utf-8") == text
+    assert doc_call.kwargs["filename"] == "response.md"
+
+
+def test_send_above_threshold_summary_includes_size():
+    """V6: summary message should communicate the size so the user knows
+    why they got a file instead of inline text.
+    """
+    channel = _make_channel_with_mock_bot()
+    text = "first line for context\n" + "x" * (FILE_ATTACH_THRESHOLD)
+    msg = OutboundMessage(target="123", text=text)
+    asyncio.run(channel.send(msg))
+    summary_call = channel._app.bot.send_message.await_args
+    summary_text = summary_call.kwargs["text"]
+    assert "KB" in summary_text
+    # First-line snippet should be present so the user has context.
+    assert "first line for context" in summary_text
+
+
+def test_send_at_or_below_max_msg_len_sends_one_message():
+    """V6: ≤ MAX_MSG_LEN → single message, no smart-split, no file."""
+    channel = _make_channel_with_mock_bot()
+    text = "x" * MAX_MSG_LEN
+    msg = OutboundMessage(target="123", text=text)
+    asyncio.run(channel.send(msg))
+    assert channel._app.bot.send_message.await_count == 1
+    assert channel._app.bot.send_document.await_count == 0

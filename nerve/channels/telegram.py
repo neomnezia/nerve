@@ -41,6 +41,11 @@ logger = logging.getLogger(__name__)
 
 # Telegram message length limit
 MAX_MSG_LEN = 4096
+# Above this size, smart-split chunk count becomes spammy and Telegram's
+# 1 msg/sec/chat throttle adds noticeable delay. Deliver as a file with a
+# short inline summary instead. Empirical pick — covers ≤5 chunks at 4 KB
+# each before it becomes annoying noise. See PR #3 design discussion.
+FILE_ATTACH_THRESHOLD = 20 * 1024  # 20 KB
 # Minimum interval between message edits (seconds) to avoid rate limits
 EDIT_INTERVAL = 1.5
 # Watchdog: check every 30s, log heartbeat every ~5 min
@@ -135,10 +140,12 @@ def _smart_split(text: str, limit: int = MAX_MSG_LEN) -> list[str]:
     if len(text) <= limit:
         return [text]
 
-    # Reserve budget for the worst-case marker "(99/99)\n" — 8 chars.
-    # We don't know M up front, so reserve a fixed overhead and refuse
-    # to produce more than 99 chunks (defensive).
-    marker_overhead = 8
+    # Reserve budget for the worst-case marker. Format is "(N/M)\n" where
+    # both N and M may grow with chunk count; reserve 12 chars so the
+    # planner stays correct up to "(9999/9999)\n". In practice callers cap
+    # input at FILE_ATTACH_THRESHOLD before reaching this function so the
+    # chunk count stays in single digits.
+    marker_overhead = 12
     inner_limit = limit - marker_overhead
 
     # Paragraph-level greedy packing.
@@ -163,6 +170,24 @@ def _smart_split(text: str, limit: int = MAX_MSG_LEN) -> list[str]:
         chunks.append(current)
 
     chunks = _balance_code_fences(chunks)
+    # Defense: _balance_code_fences can prepend an opening fence
+    # (e.g. ```python\n) and append a closing fence (\n```), growing a
+    # chunk beyond what was planned. Combined with the actual continuation
+    # marker length (which depends on the final chunk count), some chunks
+    # could still overshoot Telegram's MAX_MSG_LEN cap. Validate against
+    # the *actual* marker overhead for the current chunk count and
+    # hard-cut any genuine overflow. We loop a few times because hard-cut
+    # may grow the chunk count enough to widen the marker (e.g. 99 → 100),
+    # which tightens the budget a little; the loop converges in ≤2 passes.
+    for _ in range(3):
+        total = len(chunks)
+        actual_marker_len = (
+            len(f"({total}/{total})\n") if total > 1 else 0
+        )
+        new_chunks = _enforce_chunk_limit(chunks, limit - actual_marker_len)
+        if len(new_chunks) == total:
+            break
+        chunks = new_chunks
     return _add_continuation_markers(chunks)
 
 
@@ -244,6 +269,24 @@ def _greedy_join(parts: list[str], limit: int, *, sep: str) -> list[str]:
             current = part
     if current:
         out.append(current)
+    return out
+
+
+def _enforce_chunk_limit(chunks: list[str], limit: int) -> list[str]:
+    """Hard-cut any chunk exceeding ``limit`` (final defensive pass).
+
+    Used after :func:`_balance_code_fences` may have prepended/appended fence
+    markers, growing a chunk beyond the planned size. Without this, the
+    continuation-marker prefix would push the send payload over Telegram's
+    4096-char cap and ``send_message`` would fail.
+    """
+    out: list[str] = []
+    for chunk in chunks:
+        if len(chunk) <= limit:
+            out.append(chunk)
+            continue
+        for i in range(0, len(chunk), limit):
+            out.append(chunk[i:i + limit])
     return out
 
 
@@ -632,12 +675,30 @@ class TelegramChannel(BaseChannel):
     # ------------------------------------------------------------------ #
 
     async def send(self, message: OutboundMessage) -> None:
-        """Send a message to a Telegram chat."""
+        """Send a message to a Telegram chat.
+
+        Size-tiered delivery (V6, see PR #3 design discussion):
+
+        * ``len(text) <= MAX_MSG_LEN`` (≤4 KB) → single inline message.
+        * ``MAX_MSG_LEN < len(text) <= FILE_ATTACH_THRESHOLD`` (4–20 KB) →
+          smart-split inline with ``(N/M)`` continuation markers.
+        * ``len(text) > FILE_ATTACH_THRESHOLD`` (>20 KB) → deliver as a
+          ``response.md`` document attachment plus a one-line summary so
+          the chat history isn't spammed with 6+ chunks.
+
+        Form conversion (e.g. user wants the file form for a 10 KB
+        response) is handled via natural follow-up — the agent can call
+        ``send_file`` explicitly. No magic syntax, no UI buttons.
+        """
         if self._app is None:
             return
         chat_id = int(message.target)
         text = message.text
-        # Smart-split long messages (fence-aware, hierarchical).
+        # Above the spam threshold, deliver as a file with a brief summary.
+        if len(text) > FILE_ATTACH_THRESHOLD:
+            await self._send_as_file(chat_id, text)
+            return
+        # Otherwise, smart-split inline (fence-aware, hierarchical).
         chunks = _smart_split(text, limit=MAX_MSG_LEN)
         for chunk in chunks:
             html_chunk = _md_to_tg_html(chunk)
@@ -657,12 +718,72 @@ class TelegramChannel(BaseChannel):
             if len(chunks) > 1:
                 await asyncio.sleep(0.1)
 
+    async def _send_as_file(self, chat_id: int, text: str) -> None:
+        """Deliver an oversized response as ``response.md`` + 1-line summary.
+
+        Sent as two messages: a short inline summary (size + first line for
+        context) followed by the document attachment. The document carries
+        the full text in Markdown so the user can scroll, search, save, or
+        share without the chat history being flooded with chunks.
+
+        Only invoked from :meth:`send` when ``len(text) > FILE_ATTACH_THRESHOLD``.
+        """
+        size_kb = len(text) / 1024
+        # Snippet for context — first non-empty line, capped.
+        first_line = ""
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped:
+                first_line = stripped
+                break
+        if len(first_line) > 160:
+            first_line = first_line[:160] + "…"
+
+        if first_line:
+            summary_html = (
+                f"Response is {size_kb:.0f} KB — delivered as file.\n"
+                f"<i>{_html.escape(first_line)}</i>"
+            )
+        else:
+            summary_html = f"Response is {size_kb:.0f} KB — delivered as file."
+
+        try:
+            sent = await self._app.bot.send_message(
+                chat_id=chat_id,
+                text=summary_html,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            # Plain-text fallback if HTML parse fails.
+            sent = await self._app.bot.send_message(
+                chat_id=chat_id,
+                text=f"Response is {size_kb:.0f} KB — delivered as file.",
+            )
+        self._cache_message(sent.message_id, chat_id, summary_html)
+
+        # Send the full text as a Markdown attachment.
+        bio = io.BytesIO(text.encode("utf-8"))
+        bio.name = "response.md"
+        try:
+            await self._app.bot.send_document(
+                chat_id=chat_id,
+                document=bio,
+                filename="response.md",
+            )
+        except Exception as exc:
+            logger.warning(
+                "_send_as_file: send_document failed for chat %d (%d bytes): %s",
+                chat_id, len(text), exc,
+            )
+
     def format_response(self, text: str) -> str:
         """Identity for Telegram — actual chunking happens in :meth:`send`.
 
         Telegram messages are capped at 4096 chars; long responses are
-        split chunk-by-chunk inside ``send`` via ``_smart_split`` so we
-        do not lose the tail.
+        split chunk-by-chunk inside ``send`` via ``_smart_split``, and
+        very long responses (>``FILE_ATTACH_THRESHOLD``) are delivered as
+        a document via :meth:`_send_as_file`. Either way the tail is
+        preserved.
         """
         return text
 
