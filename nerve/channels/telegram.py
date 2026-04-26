@@ -166,6 +166,15 @@ def _smart_split(text: str, limit: int = MAX_MSG_LEN) -> list[str]:
         # Total reservation: 4 + 4 + tag = 8 + tag.
         fence_overhead = 8 + max_tag_len
     inner_limit = limit - marker_overhead - fence_overhead
+    # Degenerate-input guard: if a malformed/adversarial input has a
+    # fence info string so long that ``inner_limit`` collapses to zero
+    # or goes negative, downstream ``range(..., step=inner_limit)`` calls
+    # raise ``ValueError`` (step zero) or return ``[]`` (negative step),
+    # silently dropping the entire response. Clamp to a small positive
+    # floor so we always emit something — the fence may render broken in
+    # this pathological case, but the message body is preserved.
+    if inner_limit < 64:
+        inner_limit = 64
 
     # Paragraph-level greedy packing.
     paragraphs = text.split("\n\n")

@@ -357,6 +357,32 @@ def test_fenced_run_with_no_whitespace_anchor_stays_under_limit():
     assert not over, f"chunks exceeding MAX_MSG_LEN: {over}"
 
 
+def test_adversarial_fence_tag_does_not_crash_or_drop_content():
+    """Codex P1 (round 5): an extremely long fence info string makes
+    ``fence_overhead = 8 + max_tag_len`` collapse ``inner_limit`` to zero
+    or negative. Downstream ``range(..., step=inner_limit)`` calls then
+    raise ``ValueError`` (step 0) or return ``[]`` (negative step),
+    silently dropping the entire response. The fix clamps ``inner_limit``
+    to a small positive floor so we always emit content.
+
+    Repro from Codex: ``max_tag_len == 4076`` raises ValueError.
+    """
+    # Tag length 4076 -> inner_limit = 4096 - 12 - (8 + 4076) = 0 without clamp.
+    tag = "x" * 4076
+    text = f"```{tag}\n" + "y" * 8000 + "\n```"
+    # Must not raise.
+    chunks = _smart_split(text, limit=MAX_MSG_LEN)
+    assert chunks, "adversarial input dropped entirely"
+    assert all(len(c) <= MAX_MSG_LEN for c in chunks)
+
+    # Even more extreme: 10 000-char tag (negative inner_limit without clamp).
+    huge_tag = "x" * 10000
+    text2 = f"```{huge_tag}\n" + "y" * 8000 + "\n```"
+    chunks2 = _smart_split(text2, limit=MAX_MSG_LEN)
+    assert chunks2, "10k-tag input dropped entirely"
+    assert all(len(c) <= MAX_MSG_LEN for c in chunks2)
+
+
 def test_long_language_tag_does_not_overflow_chunks():
     """Codex P1 (round 4): Markdown allows arbitrary text in the code-fence
     info string (language tag). A long tag (>14 chars) inflates the
