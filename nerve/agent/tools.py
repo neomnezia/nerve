@@ -1755,15 +1755,12 @@ async def _send_file_impl(args: dict, session_id: str) -> dict:
         return {"content": [{"type": "text", "text": "Error: file_path is required."}]}
 
     resolved = Path(file_path).resolve()
-    if not resolved.exists() or not resolved.is_file():
+    if not resolved.is_file():
         return {"content": [{"type": "text", "text": f"Error: file not found: {file_path}"}]}
 
-    # Security: must be within workspace.
-    # Use path-aware containment (``Path.is_relative_to``) instead of a
-    # string prefix check — string prefix lets sibling-prefix paths
-    # bypass the guard (e.g. workspace ``/srv/ws`` would incorrectly
-    # accept ``/srv/ws-evil/secret.txt``). Now that send_file performs
-    # real channel delivery, that gap is exfiltration-capable.
+    # Security: workspace containment via is_relative_to (path-aware) —
+    # a string prefix check would let sibling-prefix paths slip past
+    # (e.g. workspace /srv/ws would accept /srv/ws-evil/secret.txt).
     if _workspace:
         try:
             resolved.relative_to(_workspace.resolve())
@@ -1776,11 +1773,7 @@ async def _send_file_impl(args: dict, session_id: str) -> dict:
     delivered = False
     if _engine is not None:
         try:
-            # Pass the active channel so the router does NOT fall back to
-            # ``_message_context`` when the entry is stale (e.g. a session
-            # that previously received a Telegram message and is now
-            # being driven by a web prompt — without this, the file would
-            # leak to the Telegram chat instead of the current requester).
+            # Pass active channel — router uses it to refuse stale-context dispatch.
             active_channel = _engine.get_active_channel(session_id)
             delivered = await _engine.router.send_file(
                 session_id, str(resolved), channel=active_channel,
@@ -1792,10 +1785,6 @@ async def _send_file_impl(args: dict, session_id: str) -> dict:
     if delivered:
         return {"content": [{"type": "text", "text": f"Sent file: {filename} ({file_size:,} bytes)"}]}
 
-    # Channels without SEND_FILES (or no message context, e.g. cron sessions)
-    # still get the persisted tool_call block — the web SendFileBlock renders
-    # it as a download card. Be explicit about the fallback so the agent can
-    # phrase its acknowledgement correctly on text-only channels.
     return {"content": [{"type": "text", "text": (
         f"File ready: {filename} ({file_size:,} bytes). "
         "Native delivery not available on this channel — open the web panel to download."
