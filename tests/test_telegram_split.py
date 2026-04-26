@@ -334,3 +334,46 @@ def test_balanced_fences_after_hard_cut_when_overflow_forces_split():
             f"chunk {i} has odd fence count: {body[:80]!r}…{body[-40:]!r}"
         )
         assert len(chunk) <= MAX_MSG_LEN, f"chunk {i} oversized: {len(chunk)}"
+
+
+# --------------------------------------------------------------------------- #
+#  Codex round-3 regression tests                                             #
+# --------------------------------------------------------------------------- #
+
+
+def test_fenced_run_with_no_whitespace_anchor_stays_under_limit():
+    """Codex P1 (round 3): a fenced block containing a single very long run
+    with no whitespace anchors used to produce an over-cap chunk because
+    every enforce↔rebalance cycle re-added the fence wrapping. The fix
+    reserves fence overhead at planning time so the convergence loop
+    doesn't even need to run for fenced inputs.
+
+    Repro from Codex: ``"```python\\n" + "x"*8000 + "\\n```"`` — used to
+    yield a chunk of length 4100.
+    """
+    text = "```python\n" + "x" * 8000 + "\n```"
+    chunks = _smart_split(text, limit=MAX_MSG_LEN)
+    over = [(i, len(c)) for i, c in enumerate(chunks) if len(c) > MAX_MSG_LEN]
+    assert not over, f"chunks exceeding MAX_MSG_LEN: {over}"
+
+
+def test_whitespace_only_payload_is_not_silently_dropped():
+    """Codex P2 (round 3): an input made only of paragraph separators
+    used to return ``[]`` from ``_smart_split`` because the planning loop
+    appended chunks via ``if current:`` (truthiness skips empty strings),
+    so ``_send_inline_chunks`` then sent nothing at all and the user lost
+    the message. The fix falls back to a hard char-cut when planning
+    produces no chunks.
+
+    Repro from Codex: ``"\\n" * 5000``.
+    """
+    text = "\n" * 5000
+    chunks = _smart_split(text, limit=MAX_MSG_LEN)
+    assert chunks, "whitespace-only input must produce at least one chunk"
+    # All payload bytes must be present after stripping continuation markers.
+    rebuilt = "".join(_strip_continuation_prefix(c) for c in chunks)
+    assert rebuilt.count("\n") == text.count("\n"), (
+        f"newline content lost: in={text.count(chr(10))}, out={rebuilt.count(chr(10))}"
+    )
+    # Each chunk fits the cap.
+    assert all(len(c) <= MAX_MSG_LEN for c in chunks)

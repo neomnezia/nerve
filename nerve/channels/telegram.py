@@ -146,7 +146,17 @@ def _smart_split(text: str, limit: int = MAX_MSG_LEN) -> list[str]:
     # input at FILE_ATTACH_THRESHOLD before reaching this function so the
     # chunk count stays in single digits.
     marker_overhead = 12
-    inner_limit = limit - marker_overhead
+    # If the input contains code fences, every produced chunk that ends
+    # mid-fence will gain a closing ``` (4 chars) and the next chunk will
+    # gain an opening ```<lang>\n (up to ~14 chars for "typescript").
+    # Without this reservation the post-balance chunk size can overshoot
+    # ``limit`` for fenced content with no internal whitespace anchors
+    # (e.g. a single 8 K "x" run inside ```python …```), and the
+    # convergence loop cannot close the gap because each rebalance
+    # re-adds the fence markers. Reserving up front prevents the loop
+    # from ever needing to run for fenced inputs.
+    fence_overhead = 18 if "```" in text else 0
+    inner_limit = limit - marker_overhead - fence_overhead
 
     # Paragraph-level greedy packing.
     paragraphs = text.split("\n\n")
@@ -168,6 +178,13 @@ def _smart_split(text: str, limit: int = MAX_MSG_LEN) -> list[str]:
             current = para
     if current:
         chunks.append(current)
+
+    # Defensive fallback: if planning produced no chunks (whitespace-only
+    # input where every paragraph was empty so the truthiness checks above
+    # never appended anything), hard-cut the input so we never silently
+    # return [] and lose the message body downstream.
+    if not chunks:
+        chunks = [text[i:i + inner_limit] for i in range(0, len(text), inner_limit)]
 
     chunks = _balance_code_fences(chunks)
     # Defense loop: _balance_code_fences can prepend an opening fence
