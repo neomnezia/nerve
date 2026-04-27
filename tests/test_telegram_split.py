@@ -237,6 +237,43 @@ def test_send_at_or_below_max_msg_len_sends_one_message():
     assert channel._app.bot.send_document.await_count == 0
 
 
+def test_send_empty_text_is_noop():
+    """Empty payload sends nothing — Telegram rejects empty text outright."""
+    channel = _make_channel_with_mock_bot()
+    msg = OutboundMessage(target="123", text="")
+    asyncio.run(channel.send(msg))
+    assert channel._app.bot.send_message.await_count == 0
+    assert channel._app.bot.send_document.await_count == 0
+
+
+def test_retry_after_exhaustion_does_not_sleep_on_final_attempt():
+    """Final RetryAfter is not followed by a sleep — failure propagates promptly."""
+    import time
+    from telegram.error import RetryAfter
+
+    channel = _make_channel_with_mock_bot()
+
+    async def always_flood(*args, **kwargs):
+        raise RetryAfter(2.0)  # 2-second wait — without the fix we'd sleep ×3 = 6s.
+
+    channel._app.bot.send_message = AsyncMock(side_effect=always_flood)
+    text = "tiny payload that fits in one chunk"
+    msg = OutboundMessage(target="123", text=text)
+
+    start = time.monotonic()
+    raised = None
+    try:
+        asyncio.run(channel.send(msg))
+    except RetryAfter as exc:
+        raised = exc
+    elapsed = time.monotonic() - start
+
+    assert raised is not None, "exhausted RetryAfter must propagate"
+    # 3 attempts × 2.0 s sleep = 6.0 s if buggy. Fixed: sleep after first
+    # two attempts only = 4.0 s. Tolerance for scheduler jitter.
+    assert elapsed < 5.5, f"unexpected trailing sleep: elapsed={elapsed:.2f}s"
+
+
 def test_send_document_failure_falls_back_to_inline_smart_split():
     """``send_document`` failure → inline smart-split delivers full content (no misleading summary)."""
     channel = _make_channel_with_mock_bot()

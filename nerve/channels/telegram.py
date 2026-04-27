@@ -808,6 +808,10 @@ class TelegramChannel(BaseChannel):
             return
         chat_id = int(message.target)
         text = message.text
+        # Empty payloads are a no-op — Telegram rejects empty `text`, and
+        # the pre-PR chunk loop iterated zero times in this case.
+        if not text:
+            return
         # Above the spam threshold, deliver as a file with a brief summary.
         if len(text) > FILE_ATTACH_THRESHOLD:
             await self._send_as_file(chat_id, text)
@@ -856,6 +860,10 @@ class TelegramChannel(BaseChannel):
                 return await self._app.bot.send_message(**kwargs), None
             except RetryAfter as exc:
                 last_exc = exc
+                # Skip the sleep on the final attempt — there's no retry
+                # after this, so waiting only delays failure propagation.
+                if attempt + 1 >= attempts:
+                    break
                 wait = float(getattr(exc, "retry_after", 1.0))
                 logger.warning(
                     "%s: flood-wait %.1fs (attempt %d/%d)",
