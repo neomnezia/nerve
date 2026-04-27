@@ -608,6 +608,56 @@ class TestTagParsing:
         assert tags_to_string(parse_tags_string(original)) == original
 
 
+# --- Diagnostics helpers ---
+
+@pytest.mark.asyncio
+class TestDiagnosticsHelpers:
+    """Test the count + retention helpers introduced for the diagnostics
+    endpoint. These exist to keep /api/diagnostics off full-table scans."""
+
+    async def test_count_sessions(self, db: Database):
+        await db.create_session("d-1", title="One", source="web")
+        await db.create_session("d-2", title="Two", source="web")
+        await db.create_session("d-3", title="Three", source="web")
+        # Archive d-3 directly via the status field.
+        await db.update_session_fields("d-3", {"status": "archived"})
+
+        assert await db.count_sessions() == 2
+        assert await db.count_sessions(include_archived=True) == 3
+
+    async def test_cleanup_old_cron_logs(self, db: Database):
+        # Three logs across different ages.
+        log_old = await db.log_cron_start("job-a")
+        log_mid = await db.log_cron_start("job-b")
+        log_new = await db.log_cron_start("job-c")
+
+        # Backdate two of them via direct UPDATE — the helper isn't going
+        # to time-travel for us.
+        await db.db.execute(
+            "UPDATE cron_logs SET started_at = datetime('now', '-30 days') WHERE id = ?",
+            (log_old,),
+        )
+        await db.db.execute(
+            "UPDATE cron_logs SET started_at = datetime('now', '-10 days') WHERE id = ?",
+            (log_mid,),
+        )
+        await db.db.commit()
+
+        deleted = await db.cleanup_old_cron_logs(days=14)
+        assert deleted == 1  # only the 30-day-old one
+
+        async with db.db.execute(
+            "SELECT id FROM cron_logs ORDER BY id"
+        ) as cur:
+            remaining = {row[0] async for row in cur}
+        assert remaining == {log_mid, log_new}
+
+    async def test_cleanup_old_cron_logs_noop_when_empty(self, db: Database):
+        # Nothing to delete is not an error — must return 0.
+        deleted = await db.cleanup_old_cron_logs(days=14)
+        assert deleted == 0
+
+
 # --- Consumer Cursors ---
 
 @pytest.mark.asyncio
