@@ -50,12 +50,25 @@ WATCHDOG_HEARTBEAT_EVERY = 10
 # TCP keepalive: prevent NAT/firewall from silently dropping the
 # long-poll connection.  These values tell the OS to send a keepalive
 # probe after 60s idle, retry every 10s, give up after 3 failures.
-_TCP_KEEPALIVE_OPTS = (
-    (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
-    (socket.SOL_TCP, socket.TCP_KEEPIDLE, 60),
-    (socket.SOL_TCP, socket.TCP_KEEPINTVL, 10),
-    (socket.SOL_TCP, socket.TCP_KEEPCNT, 3),
-)
+#
+# The fine-grained tuning constants (TCP_KEEPIDLE/INTVL/CNT) are Linux-only.
+# macOS exposes only TCP_KEEPALIVE (semantically equivalent to TCP_KEEPIDLE).
+# On Windows / unknown platforms we fall back to enabling SO_KEEPALIVE alone
+# and let the OS use its default keepalive timing.
+if sys.platform == "linux":
+    _TCP_KEEPALIVE_OPTS: tuple[tuple[int, int, int], ...] = (
+        (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+        (socket.SOL_TCP, socket.TCP_KEEPIDLE, 60),
+        (socket.SOL_TCP, socket.TCP_KEEPINTVL, 10),
+        (socket.SOL_TCP, socket.TCP_KEEPCNT, 3),
+    )
+elif sys.platform == "darwin":
+    _TCP_KEEPALIVE_OPTS = (
+        (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+        (socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 60),
+    )
+else:
+    _TCP_KEEPALIVE_OPTS = ((socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),)
 
 
 def _md_to_tg_html(text: str) -> str:
