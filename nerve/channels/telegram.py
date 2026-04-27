@@ -42,11 +42,19 @@ logger = logging.getLogger(__name__)
 
 # Telegram message length limit
 MAX_MSG_LEN = 4096
+# Reserve for the worst-case continuation marker "(NNNN/MMMM)\n" so the
+# planner can subtract it from MAX_MSG_LEN up to 9999 chunks.
+_MARKER_OVERHEAD = 12
 # Above this size, smart-split chunk count becomes spammy and Telegram's
 # 1 msg/sec/chat throttle adds noticeable delay. Deliver as a file with a
 # short inline summary instead. Empirical pick — covers ≤5 chunks at 4 KB
 # each before it becomes annoying noise. See PR #3 design discussion.
 FILE_ATTACH_THRESHOLD = 20 * 1024  # 20 KB
+# Per-chunk send budget for the HTML→plain fallback retry helper.
+_SEND_RETRY_ATTEMPTS = 3
+# Telegram allows ~1 message/sec/chat for bots — sleep this long between
+# inline chunks to stay under the per-chat flood limit.
+_INLINE_CHUNK_THROTTLE_S = 1.0
 # Minimum interval between message edits (seconds) to avoid rate limits
 EDIT_INTERVAL = 1.5
 # Watchdog: check every 30s, log heartbeat every ~5 min
@@ -141,62 +149,37 @@ def _smart_split(text: str, limit: int = MAX_MSG_LEN) -> list[str]:
     if len(text) <= limit:
         return [text]
 
-    # Reserve budget for the worst-case marker. Format is "(N/M)\n" where
-    # both N and M may grow with chunk count; reserve 12 chars so the
-    # planner stays correct up to "(9999/9999)\n". In practice callers cap
-    # input at FILE_ATTACH_THRESHOLD before reaching this function so the
-    # chunk count stays in single digits.
-    marker_overhead = 12
-    # If the input contains code fences, every produced chunk that ends
-    # mid-fence will gain a closing ``` (4 chars) and the next chunk will
-    # gain an opening ```<info-string>\n. Markdown allows the info string
-    # to be any text up to the next newline, so we cannot assume the
-    # familiar short tags like ``python`` — content with a 100-char tag
-    # would push the post-balance chunk past ``limit`` and the
-    # convergence loop below cannot close the gap because each rebalance
-    # re-adds the same wrapping. Reserve based on the *actual* longest
-    # info string in the input.
+    # Reserve fence-balancing overhead based on the longest info string
+    # actually present. Markdown allows arbitrary text after ``` up to
+    # the next newline, so a 100-char language tag would push the
+    # post-balance chunk past ``limit`` if we assumed only short tags
+    # like ``python``. Each closing-then-reopening cycle adds:
+    #   close = len("\n```") = 4
+    #   open  = len("```") + tag + len("\n") = 3 + tag + 1
+    # Total worst-case reservation: 8 + max_tag_len.
     fence_overhead = 0
     if "```" in text:
         fence_tags = _FENCE_RE.findall(text)
         max_tag_len = max((len(t) for t in fence_tags), default=0)
-        # Open `\n```<tag>\n` (we add `\n``` for close and prepend
-        # `\`\`\`<tag>\n` for open — combined worst case per chunk):
-        #   close = len("\n```")               = 4
-        #   open  = len("```") + tag + len("\n") = 3 + tag + 1
-        # Total reservation: 4 + 4 + tag = 8 + tag.
         fence_overhead = 8 + max_tag_len
-    inner_limit = limit - marker_overhead - fence_overhead
-    # Degenerate-input guard: if a malformed/adversarial input has a
-    # fence info string so long that ``inner_limit`` collapses to zero
-    # or goes negative, downstream ``range(..., step=inner_limit)`` calls
-    # raise ``ValueError`` (step zero) or return ``[]`` (negative step),
-    # silently dropping the entire response. Clamp to a small positive
-    # floor so we always emit something — the fence may render broken in
-    # this pathological case, but the message body is preserved.
+    inner_limit = limit - _MARKER_OVERHEAD - fence_overhead
+    # Adversarial guard: an extremely long fence info string can drive
+    # ``inner_limit`` to zero or negative, which would make the
+    # downstream ``range(..., step=inner_limit)`` calls raise
+    # ``ValueError`` (step zero) or return ``[]`` (negative step) and
+    # silently drop the entire response. Clamp to a small positive floor
+    # so the message body is always preserved (the fence may render
+    # broken, but content survives).
     if inner_limit < 64:
         inner_limit = 64
 
     # Atom-level greedy packing.
     #
-    # ``text.split("\n\n")`` consumes the paragraph separators, so naïve
-    # reassembly via concatenation would silently mutate Markdown
-    # structure ("para_a\n\npara_b" → "para_apara_b"). To make the
-    # planning loop trivially correct, we re-insert the consumed
-    # separators as their own "atoms" and pack the resulting flat
-    # alternating list of (paragraph, "\n\n", paragraph, ...) atoms.
-    #
-    # Contract: concatenating the (marker-stripped) chunks reproduces the
-    # original text exactly. Every separator atom is part of some chunk's
-    # content, so no boundary information is lost regardless of where the
-    # planner decides to split.
-    #
-    # This replaces the earlier ``needs_sep`` / ``extras`` flag-based
-    # bookkeeping (Codex rounds 6 and 7), which double-counted the
-    # implicit ``\n\n`` in normal→normal transitions and dropped extra
-    # ``\n\n`` runs from blank-paragraph collapse and leading/trailing
-    # blanks. Treating separators as first-class atoms makes those edge
-    # cases impossible by construction.
+    # ``text.split("\n\n")`` consumes the paragraph separators, so re-insert
+    # them as their own atoms in a flat alternating list of (paragraph,
+    # "\n\n", paragraph, ...). Concatenating the (marker-stripped) chunks
+    # then reproduces the original text exactly — separator atoms carry
+    # the boundary information regardless of where the planner splits.
     paragraphs = text.split("\n\n")
     atoms: list[str] = []
     for i, para in enumerate(paragraphs):
@@ -295,14 +278,10 @@ def _balance_code_fences(chunks: list[str]) -> list[str]:
         if len(fences) % 2 == 1:
             # Last unmatched fence carries the language tag (may be empty).
             pending_lang = fences[-1]
-            # Codex P2 (round 9): the previous closing path used
-            # ``body.rstrip()`` to normalize whitespace before appending
-            # ``\n```` — but for whitespace-significant code (e.g. Python
-            # blocks, ASCII tables, trailing-blank-line snippets) that
-            # silently dropped trailing spaces and blank lines from the
-            # chunk content. Append the closing fence on a fresh line
-            # without mutating any existing whitespace; if ``body``
-            # already ends in ``\n`` we reuse it, otherwise we add one.
+            # Append the closing fence on a fresh line without mutating
+            # body whitespace — Python blocks, ASCII tables, etc. can have
+            # significant trailing spaces or blank lines that ``rstrip``
+            # would silently drop.
             if body.endswith("\n"):
                 body = f"{body}```"
             else:
@@ -315,19 +294,12 @@ def _balance_code_fences(chunks: list[str]) -> list[str]:
 def _split_paragraph(para: str, limit: int) -> list[str]:
     """Split a paragraph that exceeds ``limit`` using line → sentence → char.
 
-    Codex P2 (round 9, #1): the previous implementation passed the line
-    list to ``_greedy_join(..., sep="\\n")``, which inserts ``\\n`` only
-    *within* a packed chunk. At chunk boundaries the separator was lost,
-    and any leading empty line in ``lines`` was silently dropped by the
-    truthiness-based seeding inside ``_greedy_join``. Both regressions
-    mutated content (collapsing blank-line runs).
-
-    The fix promotes the ``\\n`` separators between original lines to
-    first-class atoms, so concatenating the produced chunks reproduces
-    the paragraph exactly. Hard-cut sub-chunks emitted by
-    ``_split_long_line`` are concatenated without an inserted separator
-    (they were originally one continuous line), preserving the
-    no-anchor partition contract.
+    The ``\\n`` separators between original lines are promoted to
+    first-class atoms so concatenating the produced chunks reproduces
+    the paragraph exactly (no blank-line collapse at chunk boundaries).
+    Hard-cut sub-chunks emitted by ``_split_long_line`` are joined
+    without an inserted separator — they were originally one logical
+    line.
     """
     lines = para.split("\n")
     if all(len(line) <= limit for line in lines):
@@ -357,14 +329,9 @@ def _split_paragraph(para: str, limit: int) -> list[str]:
 def _split_long_line(line: str, limit: int) -> list[str]:
     """Split a single line by sentence boundaries; hard-cut if no boundaries help.
 
-    Codex P2 (round 8): the previous implementation used
-    ``_SENTENCE_RE.split(line)`` (no capture group), which consumed the
-    whitespace separator between sentences and then rejoined with a single
-    space — silently normalizing tabs, multiple spaces, or other layout
-    whitespace in plain-text payloads. The regex now captures the
-    separator so it can be carried through the split and reattached
-    verbatim, making the splitter a faithful partition rather than a
-    mutation of content.
+    ``_SENTENCE_RE`` captures the inter-sentence whitespace so the splitter
+    is a faithful partition — tabs, multiple spaces, and other layout
+    whitespace round-trip verbatim instead of being normalized.
     """
     # ``re.split`` with one capture group returns alternating
     # ``[text, sep, text, sep, ..., text]`` (always odd length when there
@@ -398,14 +365,9 @@ def _split_long_line(line: str, limit: int) -> list[str]:
 def _greedy_join(parts: list[str], limit: int, *, sep: str) -> list[str]:
     """Greedily concatenate ``parts`` with ``sep`` so each result fits ``limit``.
 
-    Codex P2 (round 9): the previous implementation used truthiness checks
-    on ``current`` to decide whether to seed/flush, which silently dropped
-    legitimately empty parts. For an oversized paragraph beginning with a
-    blank-line run (``"\\n" * k + long_line``), ``para.split("\\n")``
-    yields ``["", "", ..., long_line]`` and the leading ``""`` entries were
-    discarded — collapsing ``\\n\\n\\nlong`` to ``\\nlong`` after
-    reassembly. Use a ``None`` sentinel so empty parts are preserved as
-    first-class content.
+    Uses a ``None`` sentinel for ``current`` rather than truthiness so
+    legitimately-empty parts (leading blank lines etc.) survive instead
+    of being silently dropped.
     """
     out: list[str] = []
     current: str | None = None
@@ -856,97 +818,92 @@ class TelegramChannel(BaseChannel):
     async def _send_inline_chunks(self, chat_id: int, text: str) -> None:
         """Smart-split ``text`` and send each chunk inline with throttling.
 
-        Used for both the normal inline path and as the fallback delivery
-        path from :meth:`_send_as_file` when a document upload fails — so
-        a transient ``send_document`` error never causes total response
-        loss.
+        Also used as the fallback path from :meth:`_send_as_file` when the
+        document upload fails, so a transient ``send_document`` error
+        never causes total response loss.
 
-        Throttling: Telegram caps outbound at 1 message/second/chat for
-        bots. We sleep 1.0 s between chunks to match the documented limit.
-        ``RetryAfter`` from the API is honored explicitly with the
-        server-provided wait, then the chunk is retried so a transient
-        flood-wait does not abort delivery mid-response and drop the tail.
+        Sleeps ``_INLINE_CHUNK_THROTTLE_S`` *before* every chunk except
+        the first to stay under Telegram's 1 msg/sec/chat ceiling without
+        adding a trailing wait after the last chunk.
         """
         chunks = _smart_split(text, limit=MAX_MSG_LEN)
-        for chunk in chunks:
+        for i, chunk in enumerate(chunks):
+            if i > 0:
+                await asyncio.sleep(_INLINE_CHUNK_THROTTLE_S)
             await self._send_chunk_with_retry(chat_id, chunk)
-            # Throttle to respect Telegram's 1 msg/sec/chat limit.
-            if len(chunks) > 1:
-                await asyncio.sleep(1.0)
 
-    async def _send_chunk_with_retry(self, chat_id: int, chunk: str) -> None:
-        """Send one chunk with HTML/plain-text fallback and ``RetryAfter`` retry.
+    async def _send_one_with_flood_retry(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        parse_mode: str | None,
+        label: str,
+        attempts: int = _SEND_RETRY_ATTEMPTS,
+    ) -> tuple[Any | None, BaseException | None]:
+        """Send one message with bounded ``RetryAfter`` retry.
 
-        The retry path catches Telegram's flood-wait exception and sleeps
-        for the server-provided ``retry_after`` before re-attempting, so a
-        bursty caller does not lose chunks when the per-chat rate ceiling
-        is hit. Bounded at 3 attempts to avoid unbounded blocking on a
-        persistently-rate-limited chat.
-
-        On exhaustion (Codex round-7 P1), the last ``RetryAfter`` is
-        re-raised so the caller knows delivery failed. ``_send_inline_chunks``
-        then aborts further chunk sends (the chat-wide rate ceiling won't
-        clear by switching chunks), and ``send()`` lets the exception
-        propagate to ``StreamAdapter._handle_done``, which keeps the
-        streaming placeholder instead of deleting it. Without this raise,
-        callers saw a "successful" send while the response tail was lost
-        and the placeholder was deleted.
+        Returns ``(message, None)`` on success, ``(None, exc)`` on a
+        non-retryable exception (caller decides next steps), or
+        ``(None, last_RetryAfter)`` on flood-wait exhaustion.
         """
-        html_chunk = _md_to_tg_html(chunk)
+        kwargs: dict[str, Any] = {"chat_id": chat_id, "text": text}
+        if parse_mode is not None:
+            kwargs["parse_mode"] = parse_mode
         last_exc: BaseException | None = None
-        for attempt in range(3):
+        for attempt in range(attempts):
             try:
-                sent = await self._app.bot.send_message(
-                    chat_id=chat_id,
-                    text=html_chunk,
-                    parse_mode=ParseMode.HTML,
-                )
+                return await self._app.bot.send_message(**kwargs), None
             except RetryAfter as exc:
                 last_exc = exc
                 wait = float(getattr(exc, "retry_after", 1.0))
                 logger.warning(
-                    "_send_chunk_with_retry: flood-wait %.1fs (attempt %d/3)",
-                    wait, attempt + 1,
+                    "%s: flood-wait %.1fs (attempt %d/%d)",
+                    label, wait, attempt + 1, attempts,
                 )
                 await asyncio.sleep(wait)
-                continue
-            except Exception:
-                # Non-retryable HTML parse / send error — fall back to plain text.
-                try:
-                    sent = await self._app.bot.send_message(
-                        chat_id=chat_id,
-                        text=chunk,
-                    )
-                except RetryAfter as exc:
-                    last_exc = exc
-                    wait = float(getattr(exc, "retry_after", 1.0))
-                    logger.warning(
-                        "_send_chunk_with_retry: flood-wait on plain fallback "
-                        "%.1fs (attempt %d/3)", wait, attempt + 1,
-                    )
-                    await asyncio.sleep(wait)
-                    continue
-            self._cache_message(sent.message_id, chat_id, chunk)
-            return
-        logger.error(
-            "_send_chunk_with_retry: gave up after 3 attempts for chat %d",
-            chat_id,
+            except Exception as exc:
+                return None, exc
+        return None, last_exc
+
+    async def _send_chunk_with_retry(self, chat_id: int, chunk: str) -> None:
+        """Send one chunk: HTML primary, plain fallback on non-retryable error.
+
+        Raises the last ``RetryAfter`` (or ``RuntimeError``) on flood-wait
+        exhaustion so the caller aborts further chunks — the chat-wide
+        rate ceiling won't clear by switching chunks, and propagating up
+        through ``send()`` lets ``StreamAdapter._handle_done`` keep the
+        streaming placeholder instead of deleting a half-delivered tail.
+        """
+        html_chunk = _md_to_tg_html(chunk)
+        sent, exc = await self._send_one_with_flood_retry(
+            chat_id, html_chunk,
+            parse_mode=ParseMode.HTML,
+            label="_send_chunk_with_retry",
         )
-        # Surface the failure so the caller can stop sending further
-        # chunks and preserve the streaming placeholder.
-        if last_exc is not None:
-            raise last_exc
-        raise RuntimeError(
-            f"_send_chunk_with_retry exhausted retries for chat {chat_id}"
-        )
+        if sent is None and isinstance(exc, RetryAfter):
+            raise exc
+        if sent is None:
+            # Non-retryable HTML error — single plain-text attempt.
+            try:
+                sent = await self._app.bot.send_message(
+                    chat_id=chat_id, text=chunk,
+                )
+            except Exception as plain_exc:
+                logger.error(
+                    "_send_chunk_with_retry: HTML and plain both failed for "
+                    "chat %d (%s)", chat_id, plain_exc,
+                )
+                raise plain_exc
+        self._cache_message(sent.message_id, chat_id, chunk)
+
+    def _file_summary_size_line(self, text: str) -> str:
+        """Plain-text size line shared by HTML and plain summary forms."""
+        return f"Response is {len(text) / 1024:.0f} KB — delivered as file."
 
     def _build_file_summary(self, text: str) -> str:
-        """Build the HTML summary message that accompanies a file attachment.
-
-        Includes total size and a snippet of the first non-empty line so
-        the user has context without opening the document.
-        """
-        size_kb = len(text) / 1024
+        """HTML summary: size line + first-non-empty-line snippet (escaped)."""
+        base = self._file_summary_size_line(text)
         first_line = ""
         for line in text.splitlines():
             stripped = line.strip()
@@ -956,27 +913,57 @@ class TelegramChannel(BaseChannel):
         if len(first_line) > 160:
             first_line = first_line[:160] + "…"
         if first_line:
-            return (
-                f"Response is {size_kb:.0f} KB — delivered as file.\n"
-                f"<i>{_html.escape(first_line)}</i>"
+            return f"{base}\n<i>{_html.escape(first_line)}</i>"
+        return base
+
+    async def _send_summary_with_retry(
+        self, chat_id: int, html: str, plain: str,
+    ) -> Any | None:
+        """Send a file summary: HTML retried, then plain fallback also retried.
+
+        Differs from :meth:`_send_chunk_with_retry` in two ways:
+        * Plain-text fallback gets its own ``_SEND_RETRY_ATTEMPTS`` budget
+          rather than sharing one with HTML — the document is already
+          delivered, so it's worth more effort to land the summary.
+        * On exhaustion returns ``None`` instead of raising — a missing
+          summary is cosmetic, not a delivery failure, and raising would
+          make ``StreamAdapter`` clobber the streaming placeholder.
+        """
+        sent, exc = await self._send_one_with_flood_retry(
+            chat_id, html,
+            parse_mode=ParseMode.HTML,
+            label="_send_as_file: summary",
+        )
+        if sent is not None:
+            return sent
+        if isinstance(exc, RetryAfter):
+            logger.warning(
+                "_send_as_file: HTML summary flood-wait exhausted — "
+                "trying plain text",
             )
-        return f"Response is {size_kb:.0f} KB — delivered as file."
+        else:
+            logger.warning(
+                "_send_as_file: HTML summary failed (%s) — "
+                "falling back to plain text", exc,
+            )
+        sent, _ = await self._send_one_with_flood_retry(
+            chat_id, plain,
+            parse_mode=None,
+            label="_send_as_file: plain summary",
+        )
+        return sent
 
     async def _send_as_file(self, chat_id: int, text: str) -> None:
         """Deliver an oversized response as ``response.md`` + 1-line summary.
 
-        Order matters: the document is uploaded *first*. Only on a
-        successful upload do we send the inline summary — otherwise the
-        summary would falsely claim "delivered as file" while the file is
-        missing. On ``send_document`` failure (network blip, Telegram
-        rate limit, oversized file rejected), we fall back to inline
-        smart-split delivery via :meth:`_send_inline_chunks` so the
-        response is never silently lost.
+        Document goes first, then the summary — only a successful upload
+        warrants a "delivered as file" message. On ``send_document``
+        failure (network blip, rate limit, file rejected), fall back to
+        inline smart-split so the response is never silently lost.
 
         Only invoked from :meth:`send` when ``len(text) > FILE_ATTACH_THRESHOLD``.
         """
         bio = io.BytesIO(text.encode("utf-8"))
-        bio.name = "response.md"
         try:
             await self._app.bot.send_document(
                 chat_id=chat_id,
@@ -989,89 +976,15 @@ class TelegramChannel(BaseChannel):
                 "falling back to inline smart-split: %s",
                 chat_id, len(text), exc,
             )
-            # Inline fallback so the user doesn't get a misleading
-            # "delivered as file" summary with no actual content.
             await self._send_inline_chunks(chat_id, text)
             return
 
-        # Document succeeded — send the short HTML summary as a follow-up.
-        # Codex P2 (round 10): honor ``RetryAfter`` with bounded retries
-        # on both the HTML and plain-text branches. The previous
-        # implementation caught the first exception (potentially a
-        # ``RetryAfter``) and immediately tried plain-text, which in a
-        # rate-limited chat fails the same way back-to-back, raising up
-        # through ``send()`` even though the file itself was already
-        # uploaded. Streaming callers then mistake the overall delivery
-        # as failed and leave placeholders in a bad state.
-        #
-        # Strategy: mirror ``_send_chunk_with_retry`` (HTML attempts with
-        # flood-wait honored, fall back to plain on non-retryable errors,
-        # plain attempts also honor flood-wait). Difference: on retry
-        # exhaustion we *do not* raise — the document is already
-        # delivered; a missing summary is a cosmetic loss, not a
-        # delivery failure, so the caller must not treat it as one.
         summary_html = self._build_file_summary(text)
-        plain_summary = (
-            f"Response is {len(text) / 1024:.0f} KB — delivered as file."
+        summary_plain = self._file_summary_size_line(text)
+        sent = await self._send_summary_with_retry(
+            chat_id, summary_html, summary_plain,
         )
-        sent = None
-        # Pass 1: HTML attempts with RetryAfter retry. Break out on a
-        # non-retryable exception so the plain-text pass can run.
-        html_failed_non_retryable = False
-        for attempt in range(3):
-            try:
-                sent = await self._app.bot.send_message(
-                    chat_id=chat_id,
-                    text=summary_html,
-                    parse_mode=ParseMode.HTML,
-                )
-                break
-            except RetryAfter as exc:
-                wait = float(getattr(exc, "retry_after", 1.0))
-                logger.warning(
-                    "_send_as_file: summary flood-wait %.1fs (attempt %d/3)",
-                    wait, attempt + 1,
-                )
-                await asyncio.sleep(wait)
-                continue
-            except Exception as exc:
-                logger.warning(
-                    "_send_as_file: HTML summary send failed (%s) — falling back to plain text",
-                    exc,
-                )
-                html_failed_non_retryable = True
-                break
-
-        # Pass 2: plain-text fallback with RetryAfter retry — only if
-        # HTML hit a non-retryable error, or if the HTML retry loop ran
-        # out of attempts on flood-wait (sent is still None).
-        if sent is None and (html_failed_non_retryable or attempt == 2):
-            for plain_attempt in range(3):
-                try:
-                    sent = await self._app.bot.send_message(
-                        chat_id=chat_id,
-                        text=plain_summary,
-                    )
-                    break
-                except RetryAfter as exc:
-                    wait = float(getattr(exc, "retry_after", 1.0))
-                    logger.warning(
-                        "_send_as_file: plain summary flood-wait %.1fs (attempt %d/3)",
-                        wait, plain_attempt + 1,
-                    )
-                    await asyncio.sleep(wait)
-                    continue
-                except Exception as exc:
-                    logger.warning(
-                        "_send_as_file: plain summary send failed: %s", exc,
-                    )
-                    break
-
         if sent is None:
-            # Summary delivery failed after retries. The document itself
-            # is already in the chat; do not raise — that would make
-            # callers (StreamAdapter) treat overall delivery as failed
-            # and clobber the streaming placeholder.
             logger.warning(
                 "_send_as_file: summary delivery exhausted retries for chat %d "
                 "(file already uploaded; summary is cosmetic-only)",
