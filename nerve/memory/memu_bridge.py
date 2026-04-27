@@ -816,33 +816,31 @@ class MemUBridge:
                 _SEMANTIC_DEDUP_THRESHOLD,
             )
 
-            # Fix 8: Conversation preprocess is noisy on short conversations.
-            # The segmentation prompt requires segments of ≥20 messages, so any
-            # conversation with fewer messages forces the LLM to return prose
-            # ("Cannot segment, only N messages"), which then fails JSON
-            # extraction in _extract_segments_with_fallback and is logged at
-            # ERROR level (with stack trace) despite the pipeline falling back
-            # to a single-resource result. Two changes:
-            #   (a) Short-circuit _preprocess_conversation when the formatted
-            #       text has <20 message lines: skip the wasted LLM call and
-            #       return the single-resource fallback directly.
-            #   (b) Downgrade the "No JSON object found" branch in
-            #       _extract_segments_with_fallback from ERROR (with stack
-            #       trace) to WARNING. Short conversations are short-circuited
-            #       in (a) and never reach this branch, so a WARNING here
-            #       signals a genuine LLM compliance issue on a long-enough
-            #       conversation without spamming logs for the expected short
-            #       case.
+            # Fix 8: silence noisy ERROR + traceback emitted on every short
+            # cron-session memorize. memU's segmentation prompt requires
+            # segments of >=20 messages (memu/prompts/preprocess/conversation.py),
+            # so shorter conversations force the LLM to return prose and trip
+            # _extract_segments_with_fallback's `logging.exception` despite the
+            # pipeline already falling back to a single resource at
+            # memu/app/memorize.py:811-812. Two patches:
+            #   (a) Short-circuit _preprocess_conversation for <20-message
+            #       conversations, skipping the wasted LLM call.
+            #   (b) Replace _extract_segments_with_fallback with a copy that
+            #       logs WARNING (no stack trace) on JSON-extraction failure,
+            #       so genuine LLM compliance issues on long conversations
+            #       remain visible.
             from memu.app.memorize import MemorizeMixin
             from memu.utils.conversation import format_conversation_for_preprocess
 
+            # Mirrors the ">=20 messages" rule in memU's segmentation prompt.
             _SEGMENT_MIN_MESSAGES = 20
+
+            _original_preprocess_conversation = MemorizeMixin._preprocess_conversation
 
             async def _quiet_preprocess_conversation(
                 self, text, template, llm_client=None,
             ):
                 preprocessed_text = format_conversation_for_preprocess(text)
-                # Count message lines (one message per line in preprocessed form).
                 line_count = sum(1 for ln in preprocessed_text.split("\n") if ln.strip())
                 if line_count < _SEGMENT_MIN_MESSAGES:
                     logger.debug(
@@ -854,7 +852,6 @@ class MemUBridge:
                     self, text, template, llm_client=llm_client,
                 )
 
-            _original_preprocess_conversation = MemorizeMixin._preprocess_conversation
             MemorizeMixin._preprocess_conversation = _quiet_preprocess_conversation
 
             def _quiet_extract_segments(self, raw):
@@ -864,11 +861,6 @@ class MemUBridge:
                 try:
                     blob = self._extract_json_blob(raw)
                 except Exception:
-                    # Graceful fallback: pipeline already handles None segments
-                    # by emitting a single resource. Log at WARNING (no stack
-                    # trace) so a genuine LLM compliance failure on a long
-                    # conversation is still visible without the misleading
-                    # ERROR + traceback the original code produced.
                     logger.warning(
                         "Conversation preprocess returned no JSON object; "
                         "pipeline will fall back to a single resource",
