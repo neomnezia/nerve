@@ -816,6 +816,68 @@ class MemUBridge:
                 _SEMANTIC_DEDUP_THRESHOLD,
             )
 
+            # Fix 8: Conversation preprocess is noisy on short conversations.
+            # The segmentation prompt requires segments of ≥20 messages, so any
+            # conversation with fewer messages forces the LLM to return prose
+            # ("Cannot segment, only N messages"), which then fails JSON
+            # extraction in _extract_segments_with_fallback and is logged at
+            # ERROR level (with stack trace) despite the pipeline falling back
+            # to a single-resource result. Two changes:
+            #   (a) Short-circuit _preprocess_conversation when the formatted
+            #       text has <20 message lines: skip the wasted LLM call and
+            #       return the single-resource fallback directly.
+            #   (b) Downgrade the "No JSON object found" branch in
+            #       _extract_segments_with_fallback from ERROR to DEBUG, since
+            #       it's an expected outcome for any LLM that doesn't comply
+            #       with the JSON-only output instruction.
+            from memu.app.memorize import MemorizeMixin
+            from memu.utils.conversation import format_conversation_for_preprocess
+
+            _SEGMENT_MIN_MESSAGES = 20
+
+            async def _quiet_preprocess_conversation(
+                self, text, template, llm_client=None,
+            ):
+                preprocessed_text = format_conversation_for_preprocess(text)
+                # Count message lines (one message per line in preprocessed form).
+                line_count = sum(1 for ln in preprocessed_text.split("\n") if ln.strip())
+                if line_count < _SEGMENT_MIN_MESSAGES:
+                    logger.debug(
+                        "Skipping conversation segmentation: %d messages < %d threshold",
+                        line_count, _SEGMENT_MIN_MESSAGES,
+                    )
+                    return [{"text": preprocessed_text, "caption": None}]
+                return await _original_preprocess_conversation(
+                    self, text, template, llm_client=llm_client,
+                )
+
+            _original_preprocess_conversation = MemorizeMixin._preprocess_conversation
+            MemorizeMixin._preprocess_conversation = _quiet_preprocess_conversation
+
+            def _quiet_extract_segments(self, raw):
+                segments = self._segments_from_json_payload(raw)
+                if segments is not None:
+                    return segments
+                try:
+                    blob = self._extract_json_blob(raw)
+                except Exception:
+                    # Graceful fallback: pipeline already handles None segments
+                    # by emitting a single resource. Don't spam ERROR logs.
+                    logger.debug(
+                        "No JSON object in conversation preprocess response; "
+                        "skipping segmentation",
+                    )
+                    return None
+                return self._segments_from_json_payload(blob)
+
+            MemorizeMixin._extract_segments_with_fallback = _quiet_extract_segments
+
+            logger.info(
+                "Patched conversation preprocess to skip short conversations "
+                "(<%d messages) and quiet JSON-extraction fallback",
+                _SEGMENT_MIN_MESSAGES,
+            )
+
         except Exception as e:
             logger.error(
                 "memU monkey-patching failed (expected memu-py==%s): %s. "
