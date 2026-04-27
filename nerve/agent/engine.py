@@ -967,8 +967,10 @@ class AgentEngine:
 
     # Effort levels accepted per Claude model — substring-matched against the
     # full model name so dated aliases (e.g. "claude-opus-4-7-20260416") resolve.
-    # Ordered most-specific to least-specific; first match wins. Mirrors the
-    # pattern used by MODEL_PRICING in nerve/db/usage.py.
+    # Mirrors the substring-key pattern used by MODEL_PRICING in
+    # nerve/db/usage.py. If overlapping keys are added in the future (e.g. a
+    # bare "opus" alongside "opus-4-7"), order them most-specific first — the
+    # lookup loop returns the first match.
     _MODEL_EFFORT_LEVELS: dict[str, tuple[str, ...]] = {
         "opus-4-7":   ("low", "medium", "high", "xhigh", "max"),
         "opus-4-6":   ("low", "medium", "high", "max"),
@@ -978,7 +980,16 @@ class AgentEngine:
 
     @staticmethod
     def _effective_effort(value: str, model: str | None = None) -> str | None:
-        """Return ``value`` capped to the highest effort level ``model`` supports."""
+        """Return ``value`` capped to the highest effort level ``model`` supports.
+
+        Global ``agent.effort`` (e.g. ``"max"``) is shared across the main agent
+        and auxiliary models (``cron_model``, memU recall/memorize). Tiers below
+        Opus 4.7 cap at ``"high"`` (Sonnet/Haiku) or ``"max"`` (Opus 4.6, no
+        ``xhigh``), so forwarding the unmodified value triggers a 400 from the
+        upstream (or from CLIProxyAPI's tier validation). Unknown models pass
+        through unchanged so non-level-based thinking (e.g. Haiku budget_tokens)
+        is unaffected.
+        """
         if value not in AgentEngine._EFFORT_RANK:
             return None
         allowed: tuple[str, ...] | None = None
