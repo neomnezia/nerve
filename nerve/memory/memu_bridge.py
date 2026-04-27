@@ -827,9 +827,12 @@ class MemUBridge:
             #       text has <20 message lines: skip the wasted LLM call and
             #       return the single-resource fallback directly.
             #   (b) Downgrade the "No JSON object found" branch in
-            #       _extract_segments_with_fallback from ERROR to DEBUG, since
-            #       it's an expected outcome for any LLM that doesn't comply
-            #       with the JSON-only output instruction.
+            #       _extract_segments_with_fallback from ERROR (with stack
+            #       trace) to WARNING. Short conversations are short-circuited
+            #       in (a) and never reach this branch, so a WARNING here
+            #       signals a genuine LLM compliance issue on a long-enough
+            #       conversation without spamming logs for the expected short
+            #       case.
             from memu.app.memorize import MemorizeMixin
             from memu.utils.conversation import format_conversation_for_preprocess
 
@@ -862,10 +865,13 @@ class MemUBridge:
                     blob = self._extract_json_blob(raw)
                 except Exception:
                     # Graceful fallback: pipeline already handles None segments
-                    # by emitting a single resource. Don't spam ERROR logs.
-                    logger.debug(
-                        "No JSON object in conversation preprocess response; "
-                        "skipping segmentation",
+                    # by emitting a single resource. Log at WARNING (no stack
+                    # trace) so a genuine LLM compliance failure on a long
+                    # conversation is still visible without the misleading
+                    # ERROR + traceback the original code produced.
+                    logger.warning(
+                        "Conversation preprocess returned no JSON object; "
+                        "pipeline will fall back to a single resource",
                     )
                     return None
                 return self._segments_from_json_payload(blob)
