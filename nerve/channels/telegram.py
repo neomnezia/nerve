@@ -593,7 +593,9 @@ class TelegramChannel(BaseChannel):
             )
 
     def format_response(self, text: str) -> str:
-        """Telegram delivers full text via preview + file fallback in ``send``."""
+        """Truncate for Telegram if needed."""
+        if len(text) > MAX_MSG_LEN:
+            return text[:MAX_MSG_LEN - 20] + "\n\n... (truncated)"
         return text
 
     # ------------------------------------------------------------------ #
