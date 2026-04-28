@@ -19,11 +19,24 @@ import pytest
 
 from nerve.channels.base import OutboundMessage
 from nerve.channels.telegram import (
+    FLOODWAIT_GAP_S,
     MAX_MSG_LEN,
     PREVIEW_FOOTER,
     TelegramChannel,
 )
 from nerve.config import NerveConfig
+
+
+@pytest.fixture(autouse=True)
+def _patch_floodwait_sleep(monkeypatch):
+    """Replace the floodwait gap sleep with a no-op so tests don't actually wait."""
+    import nerve.channels.telegram as tg_mod
+
+    async def _fast_sleep(_secs):  # noqa: D401
+        return None
+
+    monkeypatch.setattr(tg_mod.asyncio, "sleep", _fast_sleep)
+    yield
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +142,36 @@ class TestTelegramFilename:
         assert kwargs["filename"].startswith("response-unknown-")
         assert kwargs["filename"].endswith(".md")
 
+    async def test_filename_sanitizes_unsafe_chars(self):
+        """Path separators / spaces / control chars in session_id are stripped."""
+        ch = _make_telegram_channel()
+        await ch.send(_outbound(
+            "e" * (MAX_MSG_LEN + 50), session_id="ab/cd\\ef gh\n12",
+        ))
+        kwargs = ch._app.bot.send_document.await_args.kwargs
+        # Result keeps only [A-Za-z0-9_-]; "abcdefgh12" survives.
+        assert re.fullmatch(
+            r"response-abcdefgh12-\d{8}-\d{6}\.md", kwargs["filename"],
+        )
+
+    async def test_filename_truncates_long_session_id(self):
+        """Very long session_id is capped at 16 chars in the slug."""
+        ch = _make_telegram_channel()
+        long_sid = "a" * 100
+        await ch.send(_outbound("f" * (MAX_MSG_LEN + 50), session_id=long_sid))
+        kwargs = ch._app.bot.send_document.await_args.kwargs
+        # Slug is exactly 16 'a's.
+        assert re.fullmatch(
+            r"response-a{16}-\d{8}-\d{6}\.md", kwargs["filename"],
+        )
+
+    async def test_filename_only_invalid_chars_falls_back(self):
+        """All-invalid session_id ('///\\\\') sanitizes to empty → 'unknown'."""
+        ch = _make_telegram_channel()
+        await ch.send(_outbound("g" * (MAX_MSG_LEN + 50), session_id="///\\\\"))
+        kwargs = ch._app.bot.send_document.await_args.kwargs
+        assert kwargs["filename"].startswith("response-unknown-")
+
 
 # ---------------------------------------------------------------------------
 # Failure modes & format_response identity
@@ -166,6 +209,29 @@ class TestTelegramSendFailureModes:
         assert sent_text.endswith("\n\n📎")
         # No trailing content past the footer
         assert sent_text.count("📎") == 1
+
+
+@pytest.mark.asyncio
+class TestTelegramFloodwaitGap:
+    async def test_floodwait_gap_at_least_one_second(self):
+        """Gap between preview and document must clear Telegram's 1 msg/sec/chat limit."""
+        assert FLOODWAIT_GAP_S >= 1.0
+
+    async def test_floodwait_gap_is_awaited_between_sends(self, monkeypatch):
+        """send() awaits asyncio.sleep(FLOODWAIT_GAP_S) before send_document."""
+        import nerve.channels.telegram as tg_mod
+
+        observed: list[float] = []
+
+        async def _spy_sleep(secs):
+            observed.append(secs)
+
+        monkeypatch.setattr(tg_mod.asyncio, "sleep", _spy_sleep)
+
+        ch = _make_telegram_channel()
+        await ch.send(_outbound("h" * (MAX_MSG_LEN + 100)))
+
+        assert FLOODWAIT_GAP_S in observed
 
 
 def test_format_response_identity():

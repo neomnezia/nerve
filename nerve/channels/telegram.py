@@ -48,6 +48,13 @@ MAX_MSG_LEN = 4096
 PREVIEW_FOOTER = "\n\n📎"
 # Code points reserved at the end of the preview for the footer.
 PREVIEW_RESERVE = len(PREVIEW_FOOTER)
+# Minimum gap between preview and document send to clear Telegram's per-chat
+# 1 msg/sec floodwait. Slight cushion above 1.0s for clock skew and queueing.
+FLOODWAIT_GAP_S = 1.1
+# Pattern of characters allowed in attachment filename slug derived from session_id.
+_FILENAME_SAFE_RE = re.compile(r"[^A-Za-z0-9_-]")
+# Max length of the sanitized session_id slug used in the filename.
+_FILENAME_SID_MAX = 16
 # Minimum interval between message edits (seconds) to avoid rate limits
 EDIT_INTERVAL = 1.5
 # Watchdog: check every 30s, log heartbeat every ~5 min
@@ -537,8 +544,11 @@ class TelegramChannel(BaseChannel):
         preview_len = MAX_MSG_LEN - PREVIEW_RESERVE
         preview = text[:preview_len].rstrip() + PREVIEW_FOOTER
         await self._send_single(chat_id, preview)
-        # Brief gap to stay under Telegram's 1 msg/sec/chat floodwait
-        await asyncio.sleep(0.05)
+        # Real gap to clear Telegram's per-chat 1 msg/sec floodwait. Anything
+        # under ~1s risks throttling the second send, and document-upload
+        # errors are swallowed below — without this gap users would silently
+        # lose the full response on long replies.
+        await asyncio.sleep(FLOODWAIT_GAP_S)
         await self._send_response_document(chat_id, text, message.session_id)
 
     async def _send_single(self, chat_id: int, text: str) -> None:
@@ -567,7 +577,11 @@ class TelegramChannel(BaseChannel):
         error.
         """
         ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        sid = session_id or "unknown"
+        # Sanitize session_id for the filename: strip anything outside
+        # [A-Za-z0-9_-] and cap length, so routing path values that include
+        # separators, control chars, or unusual length cannot break Telegram's
+        # send_document request validation (errors are swallowed below).
+        sid = _FILENAME_SAFE_RE.sub("", session_id or "")[:_FILENAME_SID_MAX] or "unknown"
         filename = f"response-{sid}-{ts}.md"
         bio = BytesIO(text.encode("utf-8"))
         bio.name = filename
