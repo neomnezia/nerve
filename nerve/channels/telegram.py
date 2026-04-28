@@ -19,6 +19,8 @@ import subprocess
 import sys
 import time
 import zipfile
+from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -42,6 +44,10 @@ logger = logging.getLogger(__name__)
 
 # Telegram message length limit
 MAX_MSG_LEN = 4096
+# Footer appended to the inline preview when full text is delivered as a file.
+PREVIEW_FOOTER = "\n\n📎"
+# Code points reserved at the end of the preview for the footer.
+PREVIEW_RESERVE = len(PREVIEW_FOOTER)
 # Minimum interval between message edits (seconds) to avoid rate limits
 EDIT_INTERVAL = 1.5
 # Watchdog: check every 30s, log heartbeat every ~5 min
@@ -509,32 +515,76 @@ class TelegramChannel(BaseChannel):
     # ------------------------------------------------------------------ #
 
     async def send(self, message: OutboundMessage) -> None:
-        """Send a message to a Telegram chat."""
+        """Send a message to a Telegram chat.
+
+        Short responses (≤ ``MAX_MSG_LEN``) ship as a single inline message.
+        Long responses ship as an inline preview (first ``MAX_MSG_LEN -
+        PREVIEW_RESERVE`` chars + paperclip footer) followed by a
+        document attachment containing the full original text.
+        """
         if self._app is None:
             return
         chat_id = int(message.target)
         text = message.text
-        # Split long messages
-        for i in range(0, len(text), MAX_MSG_LEN):
-            chunk = text[i:i + MAX_MSG_LEN]
-            html_chunk = _md_to_tg_html(chunk)
-            try:
-                sent = await self._app.bot.send_message(
-                    chat_id=chat_id,
-                    text=html_chunk,
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception:
-                sent = await self._app.bot.send_message(
-                    chat_id=chat_id,
-                    text=chunk,
-                )
-            self._cache_message(sent.message_id, chat_id, chunk)
+        if not text:
+            return
+
+        if len(text) <= MAX_MSG_LEN:
+            await self._send_single(chat_id, text)
+            return
+
+        # Long response: inline preview + document attachment
+        preview_len = MAX_MSG_LEN - PREVIEW_RESERVE
+        preview = text[:preview_len].rstrip() + PREVIEW_FOOTER
+        await self._send_single(chat_id, preview)
+        # Brief gap to stay under Telegram's 1 msg/sec/chat floodwait
+        await asyncio.sleep(0.05)
+        await self._send_response_document(chat_id, text, message.session_id)
+
+    async def _send_single(self, chat_id: int, text: str) -> None:
+        """Send a single message with HTML formatting and plain-text fallback."""
+        html_text = _md_to_tg_html(text)
+        try:
+            sent = await self._app.bot.send_message(
+                chat_id=chat_id,
+                text=html_text,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            sent = await self._app.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+            )
+        self._cache_message(sent.message_id, chat_id, text)
+
+    async def _send_response_document(
+        self, chat_id: int, text: str, session_id: str,
+    ) -> None:
+        """Attach the full response as a markdown document.
+
+        Failures are logged and swallowed — the inline preview has already
+        been delivered, so a missing attachment is degraded UX, not a hard
+        error.
+        """
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        sid = session_id or "unknown"
+        filename = f"response-{sid}-{ts}.md"
+        bio = BytesIO(text.encode("utf-8"))
+        bio.name = filename
+        try:
+            await self._app.bot.send_document(
+                chat_id=chat_id,
+                document=bio,
+                filename=filename,
+            )
+        except Exception as e:
+            logger.warning(
+                "send: response document upload failed for chat=%s sid=%s len=%d: %s",
+                chat_id, sid, len(text), e,
+            )
 
     def format_response(self, text: str) -> str:
-        """Truncate for Telegram if needed."""
-        if len(text) > MAX_MSG_LEN:
-            return text[:MAX_MSG_LEN - 20] + "\n\n... (truncated)"
+        """Telegram delivers full text via preview + file fallback in ``send``."""
         return text
 
     # ------------------------------------------------------------------ #
