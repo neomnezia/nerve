@@ -526,8 +526,8 @@ class TelegramChannel(BaseChannel):
 
         Short responses (≤ ``MAX_MSG_LEN``) ship as a single inline message.
         Long responses ship as an inline preview (first ``MAX_MSG_LEN -
-        PREVIEW_RESERVE`` chars + paperclip footer) followed by a
-        document attachment containing the full original text.
+        PREVIEW_RESERVE`` chars + ``PREVIEW_FOOTER`` truncation marker)
+        followed by a document attachment containing the full original text.
         """
         if self._app is None:
             return
@@ -540,7 +540,6 @@ class TelegramChannel(BaseChannel):
             await self._send_single(chat_id, text)
             return
 
-        # Long response: inline preview + document attachment
         preview_len = MAX_MSG_LEN - PREVIEW_RESERVE
         preview = text[:preview_len].rstrip() + PREVIEW_FOOTER
         await self._send_single(chat_id, preview)
@@ -592,9 +591,8 @@ class TelegramChannel(BaseChannel):
                 chat_id, sid, len(message.text), e,
             )
 
-    def format_response(self, text: str) -> str:
-        """Telegram delivers full text via preview + file fallback in ``send``."""
-        return text
+    # Length policy lives in ``send`` (preview + file fallback).
+    # ``format_response`` inherited from base (identity).
 
     # ------------------------------------------------------------------ #
     #  Streaming protocol                                                  #
