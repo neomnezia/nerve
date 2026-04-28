@@ -197,14 +197,14 @@ class TestTelegramSendFailureModes:
             for rec in caplog.records
         )
 
-    async def test_preview_footer_is_paperclip_only(self):
-        """Preview ends with exactly PREVIEW_FOOTER ('\\n\\n📎'), nothing more."""
+    async def test_preview_footer_is_truncated_marker_only(self):
+        """Preview ends with exactly PREVIEW_FOOTER ('\\n\\n... (truncated)'), nothing more."""
         ch = _make_telegram_channel()
         await ch.send(_outbound("d" * (MAX_MSG_LEN + 200)))
         sent_text = ch._app.bot.send_message.await_args.kwargs["text"]
-        assert sent_text.endswith("\n\n📎")
+        assert sent_text.endswith("\n\n... (truncated)")
         # No trailing content past the footer
-        assert sent_text.count("📎") == 1
+        assert sent_text.count("(truncated)") == 1
 
 
 @pytest.mark.asyncio

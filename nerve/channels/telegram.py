@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 # Telegram message length limit
 MAX_MSG_LEN = 4096
 # Footer appended to the inline preview when full text is delivered as a file.
-PREVIEW_FOOTER = "\n\n📎"
+PREVIEW_FOOTER = "\n\n... (truncated)"
 # Code points reserved at the end of the preview for the footer.
 PREVIEW_RESERVE = len(PREVIEW_FOOTER)
 # Minimum gap between preview and document send to clear Telegram's per-chat
