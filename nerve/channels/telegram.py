@@ -544,12 +544,7 @@ class TelegramChannel(BaseChannel):
         preview_len = MAX_MSG_LEN - PREVIEW_RESERVE
         preview = text[:preview_len].rstrip() + PREVIEW_FOOTER
         await self._send_single(chat_id, preview)
-        # Real gap to clear Telegram's per-chat 1 msg/sec floodwait. Anything
-        # under ~1s risks throttling the second send, and document-upload
-        # errors are swallowed below — without this gap users would silently
-        # lose the full response on long replies.
-        await asyncio.sleep(FLOODWAIT_GAP_S)
-        await self._send_response_document(chat_id, text, message.session_id)
+        await self._send_response_document(chat_id, message)
 
     async def _send_single(self, chat_id: int, text: str) -> None:
         """Send a single message with HTML formatting and plain-text fallback."""
@@ -568,23 +563,23 @@ class TelegramChannel(BaseChannel):
         self._cache_message(sent.message_id, chat_id, text)
 
     async def _send_response_document(
-        self, chat_id: int, text: str, session_id: str,
+        self, chat_id: int, message: OutboundMessage,
     ) -> None:
         """Attach the full response as a markdown document.
 
-        Failures are logged and swallowed — the inline preview has already
-        been delivered, so a missing attachment is degraded UX, not a hard
-        error.
+        Waits ``FLOODWAIT_GAP_S`` before uploading to clear Telegram's per-chat
+        1 msg/sec floodwait — anything shorter risks throttling the document
+        send, which would silently leave the user with only the preview
+        because upload failures are swallowed below.
         """
+        # Sanitize session_id: strip anything outside [A-Za-z0-9_-] and cap
+        # length so routing-path values with separators, control chars, or
+        # unusual length cannot break send_document request validation.
+        sid = _FILENAME_SAFE_RE.sub("", message.session_id or "")[:_FILENAME_SID_MAX] or "unknown"
         ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        # Sanitize session_id for the filename: strip anything outside
-        # [A-Za-z0-9_-] and cap length, so routing path values that include
-        # separators, control chars, or unusual length cannot break Telegram's
-        # send_document request validation (errors are swallowed below).
-        sid = _FILENAME_SAFE_RE.sub("", session_id or "")[:_FILENAME_SID_MAX] or "unknown"
         filename = f"response-{sid}-{ts}.md"
-        bio = BytesIO(text.encode("utf-8"))
-        bio.name = filename
+        bio = BytesIO(message.text.encode("utf-8"))
+        await asyncio.sleep(FLOODWAIT_GAP_S)
         try:
             await self._app.bot.send_document(
                 chat_id=chat_id,
@@ -594,7 +589,7 @@ class TelegramChannel(BaseChannel):
         except Exception as e:
             logger.warning(
                 "send: response document upload failed for chat=%s sid=%s len=%d: %s",
-                chat_id, sid, len(text), e,
+                chat_id, sid, len(message.text), e,
             )
 
     def format_response(self, text: str) -> str:

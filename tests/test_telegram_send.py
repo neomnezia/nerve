@@ -104,20 +104,16 @@ class TestTelegramSendLengthPolicy:
         assert doc_arg.getvalue() == text.encode("utf-8")
         assert len(doc_arg.getvalue()) == MAX_MSG_LEN + 1
 
-    async def test_send_long_8000_full_in_file(self):
-        """8000-char response: file holds full original; preview ≤ MAX_MSG_LEN."""
+    async def test_send_long_preview_holds_text_prefix(self):
+        """Preview body is a prefix of the original — content not lost on the wire."""
         ch = _make_telegram_channel()
-        text = "z" * 8000
+        text = ("paragraph one. " * 600).strip()  # ~9000 chars, > MAX_MSG_LEN
         await ch.send(_outbound(text))
 
-        # Preview is bounded by MAX_MSG_LEN
         sent_text = ch._app.bot.send_message.await_args.kwargs["text"]
-        assert len(sent_text) <= MAX_MSG_LEN
-
-        # Document holds the full unmodified original
-        doc_arg = ch._app.bot.send_document.await_args.kwargs["document"]
-        assert doc_arg.getvalue() == text.encode("utf-8")
-        assert len(doc_arg.getvalue()) == 8000
+        assert sent_text.endswith(PREVIEW_FOOTER)
+        body = sent_text[: -len(PREVIEW_FOOTER)].rstrip()
+        assert text.startswith(body)
 
 
 # ---------------------------------------------------------------------------
