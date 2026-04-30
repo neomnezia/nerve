@@ -214,6 +214,17 @@ export const api = {
   getCronLogs: (jobId?: string, limit = 50) =>
     request<{ logs: any[] }>(`/cron/logs?job_id=${jobId || ''}&limit=${limit}`),
 
+  // Observability — lightweight status for UI deep-links
+  getObservabilityStatus: () =>
+    request<{
+      langfuse: {
+        enabled: boolean;
+        host: string | null;
+        auth_ok: boolean;
+        last_flush_at: string | null;
+      };
+    }>('/observability/status'),
+
   // Cron jobs
   listCronJobs: () => request<{ jobs: any[] }>('/cron/jobs'),
   triggerCronJob: (jobId: string) =>
